@@ -209,6 +209,8 @@
           <span class="lyrics-track-artist">YouTube Music</span>
         </div>
         <div class="lyrics-header-actions">
+          <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
+          <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
           <span class="lyrics-status-badge">STANDBY</span>
           <button class="lyrics-close-btn" title="Close lyrics panel (Alt+L)">&times;</button>
         </div>
@@ -230,6 +232,21 @@
     const closeBtn = viewportEl.querySelector('.lyrics-close-btn');
     closeBtn.addEventListener('click', () => togglePanelVisibility(false));
 
+    // Font size controls
+    let currentFontSize = 30;
+    const setFontSize = (size, save = true) => {
+      currentFontSize = Math.max(18, Math.min(46, size));
+      viewportEl.style.setProperty('--ytm-lyric-font-size', `${currentFontSize}px`);
+      if (save) {
+        chrome.storage.local.set({ lyricsFontSize: currentFontSize });
+      }
+    };
+
+    const fontDecBtn = viewportEl.querySelector('#lyrics-font-dec');
+    const fontIncBtn = viewportEl.querySelector('#lyrics-font-inc');
+    fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
+    fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
+
     // Enable drag & drop on header
     const headerEl = viewportEl.querySelector('.lyrics-header');
     setupPanelDragging(viewportEl, headerEl);
@@ -243,8 +260,8 @@
       }, 3500);
     }, { passive: true });
 
-    // Restore saved visibility and position preferences
-    chrome.storage.local.get(['lyricsPanelVisible', 'lyricsPosition'], (result) => {
+    // Restore saved visibility, position, and font size preferences
+    chrome.storage.local.get(['lyricsPanelVisible', 'lyricsPosition', 'lyricsFontSize'], (result) => {
       if (typeof result.lyricsPanelVisible === 'boolean') {
         togglePanelVisibility(result.lyricsPanelVisible, false);
       }
@@ -252,6 +269,9 @@
         viewportEl.style.right = 'auto';
         viewportEl.style.left = result.lyricsPosition.left;
         viewportEl.style.top = result.lyricsPosition.top;
+      }
+      if (typeof result.lyricsFontSize === 'number') {
+        setFontSize(result.lyricsFontSize, false);
       }
     });
 
