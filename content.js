@@ -230,6 +230,10 @@
     const closeBtn = viewportEl.querySelector('.lyrics-close-btn');
     closeBtn.addEventListener('click', () => togglePanelVisibility(false));
 
+    // Enable drag & drop on header
+    const headerEl = viewportEl.querySelector('.lyrics-header');
+    setupPanelDragging(viewportEl, headerEl);
+
     // Handle user manual scroll: temporarily disable auto-scroll snap
     scrollContainerEl.addEventListener('wheel', () => {
       isUserScrolling = true;
@@ -239,10 +243,15 @@
       }, 3500);
     }, { passive: true });
 
-    // Restore saved visibility preference
-    chrome.storage.local.get(['lyricsPanelVisible'], (result) => {
+    // Restore saved visibility and position preferences
+    chrome.storage.local.get(['lyricsPanelVisible', 'lyricsPosition'], (result) => {
       if (typeof result.lyricsPanelVisible === 'boolean') {
         togglePanelVisibility(result.lyricsPanelVisible, false);
+      }
+      if (result.lyricsPosition && viewportEl) {
+        viewportEl.style.right = 'auto';
+        viewportEl.style.left = result.lyricsPosition.left;
+        viewportEl.style.top = result.lyricsPosition.top;
       }
     });
 
@@ -275,6 +284,82 @@
     if (save) {
       chrome.storage.local.set({ lyricsPanelVisible: show });
     }
+  }
+
+  /**
+   * Configure drag & drop mechanics and position persistence.
+   */
+  function setupPanelDragging(panel, handle) {
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let initialLeft = 0;
+    let initialTop = 0;
+
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) return;
+
+      isDragging = true;
+      handle.classList.add('grabbing');
+
+      const rect = panel.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      initialLeft = rect.left;
+      initialTop = rect.top;
+
+      panel.style.right = 'auto';
+      panel.style.left = `${initialLeft}px`;
+      panel.style.top = `${initialTop}px`;
+      panel.style.transition = 'opacity 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.8s ease, box-shadow 0.8s ease';
+
+      handle.setPointerCapture?.(e.pointerId);
+    });
+
+    window.addEventListener('pointermove', (e) => {
+      if (!isDragging) return;
+
+      const deltaX = e.clientX - startX;
+      const deltaY = e.clientY - startY;
+
+      let newLeft = initialLeft + deltaX;
+      let newTop = initialTop + deltaY;
+
+      const maxLeft = Math.max(10, window.innerWidth - panel.offsetWidth - 10);
+      const maxTop = Math.max(10, window.innerHeight - panel.offsetHeight - 10);
+
+      newLeft = Math.max(10, Math.min(newLeft, maxLeft));
+      newTop = Math.max(10, Math.min(newTop, maxTop));
+
+      panel.style.left = `${newLeft}px`;
+      panel.style.top = `${newTop}px`;
+    });
+
+    const stopDrag = () => {
+      if (!isDragging) return;
+      isDragging = false;
+      handle.classList.remove('grabbing');
+      panel.style.transition = '';
+
+      chrome.storage.local.set({
+        lyricsPosition: {
+          left: panel.style.left,
+          top: panel.style.top
+        }
+      });
+    };
+
+    window.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointercancel', stopDrag);
+
+    // Double-click on header to snap back to default top-right anchor
+    handle.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button')) return;
+      panel.style.left = '';
+      panel.style.top = '9vh';
+      panel.style.right = '32px';
+      chrome.storage.local.remove('lyricsPosition');
+    });
   }
 
   /**

@@ -9,6 +9,7 @@ A modern Manifest V3 Chrome/Edge extension that brings Apple Music-style glassmo
 - **Dynamic Color Extraction**: Samples album artwork via an offscreen canvas to dynamically adapt the panel background and ambient glow.
 - **Smooth Auto-Centering Scroll**: Calculates the vertical midpoint dynamically so the current lyric line is always highlighted and centered.
 - **Interactive Seek**: Click on any lyric line to jump the track directly to that timestamp.
+- **Draggable & Persistent**: Drag the panel header to position it anywhere on screen. Position is saved across sessions. Double-click the header to reset back to default.
 - **Manual Scroll Awareness**: Detects manual user scrolling and temporarily pauses auto-centering for 3.5 seconds before snapping back.
 - **Desktop & PWA Compatible**: Works seamlessly both on `music.youtube.com` in standard tabs and inside the installed YouTube Music desktop PWA.
 - **Dedicated Controls**: Injected player bar toggle button and keyboard shortcut (`Alt + L`).
