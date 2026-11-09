@@ -11,6 +11,7 @@
   let parsedLyrics = [];
   let isSynced = false;
   let activeIndex = -1;
+  let syncOffset = 0;
   let syncAnimationFrameId = null;
   let userScrollingTimer = null;
   let isUserScrolling = false;
@@ -204,15 +205,20 @@
 
     viewportEl.innerHTML = `
       <div class="lyrics-header">
-        <div class="lyrics-meta">
-          <span class="lyrics-track-title">Waiting for music...</span>
-          <span class="lyrics-track-artist">YouTube Music</span>
-        </div>
-        <div class="lyrics-header-actions">
-          <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
-          <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
-          <span class="lyrics-status-badge">STANDBY</span>
-          <button class="lyrics-close-btn" title="Close lyrics panel (Alt+L)">&times;</button>
+        <div class="lyrics-drag-handle"></div>
+        <div class="lyrics-header-row">
+          <div class="lyrics-meta">
+            <span class="lyrics-track-title">Waiting for music...</span>
+            <span class="lyrics-track-artist">YouTube Music</span>
+          </div>
+          <div class="lyrics-header-actions">
+            <button class="lyrics-action-btn" id="lyrics-offset-dec" title="Delay lyrics (-0.5s)">-0.5s</button>
+            <button class="lyrics-action-btn" id="lyrics-offset-inc" title="Advance lyrics (+0.5s)">+0.5s</button>
+            <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
+            <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
+            <span class="lyrics-status-badge">STANDBY</span>
+            <button class="lyrics-close-btn" title="Close lyrics panel (Alt+L)">&times;</button>
+          </div>
         </div>
       </div>
       <div class="lyrics-scroll-container">
@@ -231,6 +237,39 @@
     // Close button
     const closeBtn = viewportEl.querySelector('.lyrics-close-btn');
     closeBtn.addEventListener('click', () => togglePanelVisibility(false));
+
+    // Sync offset calibration controls
+    const updateSyncOffsetBadge = () => {
+      if (!isSynced) return;
+      if (syncOffset === 0) {
+        statusBadgeEl.textContent = 'SYNCED';
+        statusBadgeEl.title = '';
+      } else {
+        const sign = syncOffset > 0 ? '+' : '';
+        statusBadgeEl.textContent = `${sign}${syncOffset.toFixed(1)}s`;
+        statusBadgeEl.title = 'Click to reset offset to 0s';
+      }
+    };
+
+    const offsetDecBtn = viewportEl.querySelector('#lyrics-offset-dec');
+    const offsetIncBtn = viewportEl.querySelector('#lyrics-offset-inc');
+
+    offsetDecBtn.addEventListener('click', () => {
+      syncOffset = Math.round((syncOffset - 0.5) * 10) / 10;
+      updateSyncOffsetBadge();
+    });
+
+    offsetIncBtn.addEventListener('click', () => {
+      syncOffset = Math.round((syncOffset + 0.5) * 10) / 10;
+      updateSyncOffsetBadge();
+    });
+
+    statusBadgeEl.addEventListener('click', () => {
+      if (syncOffset !== 0) {
+        syncOffset = 0;
+        updateSyncOffsetBadge();
+      }
+    });
 
     // Font size controls
     let currentFontSize = 30;
@@ -489,6 +528,7 @@
 
     wrapperEl.innerHTML = '';
     wrapperEl.appendChild(fragment);
+    wrapperEl.style.transform = 'translateY(0px)';
     activeIndex = -1;
 
     startSyncLoop();
@@ -511,7 +551,7 @@
         return;
       }
 
-      const currentTime = video.currentTime;
+      const currentTime = video.currentTime + syncOffset;
       let currentIndex = -1;
 
       for (let i = 0; i < parsedLyrics.length; i++) {
@@ -536,14 +576,19 @@
         }
 
         // Auto scroll translation calculation:
-        // Desplazamiento = (Alto del Contenedor / 2) - (Posición Y de la Línea + Alto de la Línea / 2)
-        if (activeIndex !== -1 && domLines[activeIndex] && !isUserScrolling && scrollContainerEl) {
-          const activeLine = domLines[activeIndex];
-          const containerCenter = scrollContainerEl.clientHeight / 2;
-          const lineCenter = activeLine.offsetTop + (activeLine.clientHeight / 2);
-          const translateY = containerCenter - lineCenter;
+        // Clamping with Math.min(0, ...) keeps the lyrics starting naturally at the top
+        // and only scrolling upward as the song progresses!
+        if (!isUserScrolling && scrollContainerEl) {
+          if (activeIndex !== -1 && domLines[activeIndex]) {
+            const activeLine = domLines[activeIndex];
+            const targetAnchor = scrollContainerEl.clientHeight * 0.22;
+            const lineTop = activeLine.offsetTop;
+            const translateY = Math.min(0, targetAnchor - lineTop);
 
-          wrapperEl.style.transform = `translateY(${translateY}px)`;
+            wrapperEl.style.transform = `translateY(${translateY}px)`;
+          } else {
+            wrapperEl.style.transform = 'translateY(0px)';
+          }
         }
       }
 
@@ -578,6 +623,7 @@
     if (songKey === currentSongKey) return;
 
     currentSongKey = songKey;
+    syncOffset = 0;
     initLyricsUI();
     injectToggleButton();
 
