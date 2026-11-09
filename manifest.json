@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "YTM Sync Lyrics",
+  "version": "1.0.0",
+  "description": "Synced and beautifully styled glassmorphism lyrics for YouTube Music desktop and PWA.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://music.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "*://music.youtube.com/*",
+    "*://*.ggpht.com/*",
+    "*://*.googleusercontent.com/*",
+    "*://*.youtube.com/*",
+    "https://lrclib.net/*"
+  ]
+}
