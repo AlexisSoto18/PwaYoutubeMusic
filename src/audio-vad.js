@@ -298,9 +298,41 @@
     };
   }
 
+  function getDiagnostics(video) {
+    let maxBin = 0;
+    if (freqBuffer) {
+      for (let i = 0; i < freqBuffer.length; i++) {
+        if (freqBuffer[i] > maxBin) maxBin = freqBuffer[i];
+      }
+    }
+    const streamTracks = attachedStream ? attachedStream.getAudioTracks().map(t => ({
+      readyState: t.readyState,
+      enabled: t.enabled,
+      muted: t.muted
+    })) : [];
+
+    return {
+      audioCtxState: audioCtx ? audioCtx.state : 'none',
+      sampleRate: audioCtx ? audioCtx.sampleRate : 0,
+      hasMediaKeysDRM: Boolean(video && video.mediaKeys),
+      videoSrc: video ? (video.currentSrc || video.src || '').slice(0, 48) : 'none',
+      streamTracks,
+      isSignalAvailable,
+      nonZeroFramesCount,
+      maxFftBinValue: maxBin,
+      rollingNoiseFloor: Math.round(rollingNoiseFloor * 10) / 10,
+      rollingPeakVocal: Math.round(rollingPeakVocal * 10) / 10,
+      vocalScore: Math.round(smoothedVocalScore * 100) / 100,
+      isVocalActive,
+      hasDetectedFirstVocal,
+      firstVocalOnsetTime
+    };
+  }
+
   window.YTMLyrics.AudioVAD = {
     resetTrackState,
     sampleFrame,
-    getState
+    getState,
+    getDiagnostics
   };
 })();

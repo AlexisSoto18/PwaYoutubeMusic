@@ -32,7 +32,8 @@
 
   const {
     resetTrackState: resetVADState,
-    sampleFrame: sampleVADFrame
+    sampleFrame: sampleVADFrame,
+    getDiagnostics: getVADDiagnostics
   } = window.YTMLyrics.AudioVAD;
 
   // --- Controller State ---
@@ -42,6 +43,7 @@
   let currentLyricsData = null;
   let currentLRCLIBResults = null;
   let currentASRSegments = [];
+  let latestNetDiagnostics = [];
   let currentUserAnchors = {};
   let savedAnchorsBySong = {};
   let parsedLyrics = [];
@@ -106,6 +108,68 @@
       }
     }
   });
+
+  window.addEventListener('ytm-lyrics-net-diag', (e) => {
+    if (e.detail && Array.isArray(e.detail.logs)) {
+      latestNetDiagnostics = e.detail.logs;
+    }
+  });
+
+  window.addEventListener('ytm-lyrics-native-timed', (e) => {
+    const lines = e.detail?.lines;
+    if (Array.isArray(lines) && lines.length > 0 && isPredictedSync) {
+      parsedLyrics = lines;
+      isPredictedSync = false;
+      alignmentModeLabel = 'YTM SYNCED';
+      activeIndex = -2;
+      updateBadgeDisplay();
+    }
+  });
+
+  /**
+   * Build and copy a complete sanitized diagnostic report to the clipboard.
+   */
+  async function copyDiagnosticsReport(btnEl) {
+    const video = getActiveVideo();
+    const report = {
+      timestamp: new Date().toISOString(),
+      track: {
+        songKey: currentSongKey,
+        title: currentTitle,
+        artist: currentArtist,
+        expectedDuration: getExpectedTrackDuration(false),
+        accuratePlaybackTime: Math.round(getAccuratePlaybackTime() * 100) / 100,
+        rawVideoCurrentTime: video ? Math.round(video.currentTime * 100) / 100 : null
+      },
+      syncState: {
+        isSynced,
+        isPredictedSync,
+        alignmentModeLabel,
+        syncOffset,
+        activeIndex,
+        lyricsSource: currentLyricsData?.source || 'none',
+        lyricsType: currentLyricsData?.type || 'none',
+        asrSegmentsCount: currentASRSegments.length,
+        userAnchors: currentUserAnchors,
+        sampleLines: parsedLyrics.slice(0, 8)
+      },
+      audioVAD: getVADDiagnostics(video),
+      networkLogs: latestNetDiagnostics.slice(-8)
+    };
+
+    const json = JSON.stringify(report, null, 2);
+    console.log('[YTM Sync Diagnostics]', report);
+    try {
+      await navigator.clipboard.writeText(json);
+      if (btnEl) {
+        const prev = btnEl.textContent;
+        btnEl.textContent = 'COPIED!';
+        setTimeout(() => {
+          btnEl.textContent = prev;
+        }, 1600);
+      }
+    } catch (_) {}
+  }
 
   /**
    * Persist user multi-anchors for the current track in chrome.storage.local.
@@ -206,6 +270,7 @@
             <button class="lyrics-action-btn" id="lyrics-offset-inc" title="Advance lyrics (+0.5s)">+0.5s</button>
             <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
             <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
+            <button class="lyrics-action-btn" id="lyrics-copy-diag" title="Copy Network & Audio VAD Diagnostics JSON">LOG</button>
             <span class="lyrics-status-badge">STANDBY</span>
           </div>
         </div>
@@ -256,8 +321,12 @@
 
       const fontDecBtn = container.querySelector('#lyrics-font-dec');
       const fontIncBtn = container.querySelector('#lyrics-font-inc');
+      const copyDiagBtn = container.querySelector('#lyrics-copy-diag');
       fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
       fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
+      if (copyDiagBtn) {
+        copyDiagBtn.addEventListener('click', () => copyDiagnosticsReport(copyDiagBtn));
+      }
 
       const handleUserManualScroll = () => {
         isUserScrolling = true;
