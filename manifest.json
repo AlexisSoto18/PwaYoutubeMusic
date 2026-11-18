@@ -14,9 +14,21 @@
   "content_scripts": [
     {
       "matches": ["*://music.youtube.com/*"],
-      "js": ["content.js"],
+      "js": [
+        "src/phonetics.js",
+        "src/player-clock.js",
+        "src/forced-alignment.js",
+        "src/lyrics-provider.js",
+        "content.js"
+      ],
       "css": ["styles.css"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/page-bridge.js"],
+      "matches": ["*://music.youtube.com/*"]
     }
   ],
   "permissions": [

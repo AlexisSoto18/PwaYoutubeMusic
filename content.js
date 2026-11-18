@@ -1,20 +1,45 @@
 /**
- * YTM Sync Lyrics - Content Script
- * Native Embedded Synchronized Lyrics for YouTube Music Desktop & PWA.
+ * YTM Sync Lyrics - Main UI & Lifecycle Controller
+ * Coordinates the modular subsystems:
+ * - YTMLyrics.Phonetics (G2P & phonetic similarity)
+ * - YTMLyrics.ForcedAlignment (DTW / Viterbi & dynamic re-alignment)
+ * - YTMLyrics.PlayerClock (Player bar clock & DOM inspection)
+ * - YTMLyrics.LyricsProvider (LRCLIB search & LRC parsing)
  */
 
 (() => {
   'use strict';
 
-  // --- State ---
+  const {
+    getActiveVideo,
+    getAccuratePlaybackTime,
+    getExpectedTrackDuration,
+    getPlayerLyricsShelf,
+    getNativeYTMLyrics
+  } = window.YTMLyrics.PlayerClock;
+
+  const {
+    parseLRC,
+    pickBestLyricsFromResults,
+    fetchLyrics
+  } = window.YTMLyrics.LyricsProvider;
+
+  const {
+    alignLyrics,
+    realignFromUserAnchor
+  } = window.YTMLyrics.ForcedAlignment;
+
+  // --- Controller State ---
   let currentSongKey = '';
   let currentTitle = '';
   let currentArtist = '';
   let currentLyricsData = null;
   let currentLRCLIBResults = null;
+  let currentASRSegments = [];
   let parsedLyrics = [];
   let isSynced = false;
   let isPredictedSync = false;
+  let alignmentModeLabel = 'SYNCED';
   let lastPredictedDuration = 0;
   let activeIndex = -2;
   let syncOffset = 0;
@@ -28,7 +53,7 @@
   let trackChangeTimestamp = 0;
   let boundVideoEl = null;
 
-  // --- Elements Cache ---
+  // --- UI Element References ---
   let embeddedContainerEl = null;
   let scrollBoxEl = null;
   let trackTitleEl = null;
@@ -36,394 +61,63 @@
   let toggleBtnEl = null;
 
   /**
-   * Parse LRC formatted text into structured array of objects.
-   * Matches [mm:ss.xx] or [mm:ss.xxx] and sorts chronologically.
+   * Inject Main World page-bridge.js to extract YouTube's internal CTC/ASR captionTracks (json3).
    */
-  function parseLRC(lrcText) {
-    if (!lrcText) return [];
-    const lines = lrcText.split('\n');
-    const regex = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\](.*)/;
-    const parsed = [];
-
-    for (const line of lines) {
-      const match = line.match(regex);
-      if (match) {
-        const minutes = parseInt(match[1], 10);
-        const seconds = parseInt(match[2], 10);
-        const msRaw = match[3] || '0';
-        const milliseconds = parseInt(msRaw.padEnd(3, '0').slice(0, 3), 10) / 1000;
-        const timeInSeconds = minutes * 60 + seconds + milliseconds;
-        const text = match[4].trim();
-
-        if (text) {
-          parsed.push({ time: timeInSeconds, text });
-        }
-      }
+  function injectPageBridge() {
+    if (document.getElementById('ytm-lyrics-page-bridge')) return;
+    try {
+      const script = document.createElement('script');
+      script.id = 'ytm-lyrics-page-bridge';
+      script.src = chrome.runtime.getURL('src/page-bridge.js');
+      (document.head || document.documentElement).appendChild(script);
+    } catch (e) {
+      console.warn('[YTM Sync Lyrics] Could not inject page bridge:', e);
     }
-
-    return parsed.sort((a, b) => a.time - b.time);
   }
 
   /**
-   * Phonetic & Structural Prediction Algorithm for Plain Lyrics (PLAIN / YTM PLAIN).
-   * Estimates line timestamps by modeling:
-   * 1. Instrumental intro & outro margins (~8% of duration, clamped).
-   * 2. Phonetic syllable count per line (vowel clusters) + base phrase breath.
-   * 3. Stanza breaks (\n\n) and mid-song instrumental interlude (requinto/solo).
+   * Listen for CTC/ASR timedtext segments from page-bridge.js and run Forced Alignment if on plain lyrics.
    */
-  function predictSyncedLyrics(plainText, durationSeconds) {
-    if (!plainText) return [];
-    const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
+  window.addEventListener('ytm-lyrics-asr-data', (e) => {
+    const detail = e.detail;
+    if (!detail || !Array.isArray(detail.segments)) return;
 
-    const rawLines = plainText.split('\n');
-    const items = [];
-    let pendingStanzaBreak = false;
+    currentASRSegments = detail.segments;
 
-    for (const raw of rawLines) {
-      const text = raw.trim();
-      if (!text) {
-        if (items.length > 0) {
-          pendingStanzaBreak = true;
-        }
-        continue;
-      }
-
-      // Count syllable clusters (Spanish/English vowels)
-      const syllables = (text.match(/[aeiouáéíóúü]+/gi) || []).length || 1;
-      const lineWeight = 1.35 + (syllables * 0.22);
-
-      items.push({
-        text,
-        lineWeight,
-        hasStanzaBreakBefore: pendingStanzaBreak,
-        pauseWeightBefore: 0
-      });
-      pendingStanzaBreak = false;
-    }
-
-    if (items.length === 0) return [];
-
-    // Identify the main mid-song instrumental interlude (stanza break closest to 50% of the song)
-    let midBridgeIndex = -1;
-    let bestDistFromMid = Infinity;
-    const midPoint = items.length * 0.5;
-
-    for (let i = 1; i < items.length; i++) {
-      if (items[i].hasStanzaBreakBefore) {
-        const ratio = i / items.length;
-        if (ratio >= 0.35 && ratio <= 0.68) {
-          const dist = Math.abs(i - midPoint);
-          if (dist < bestDistFromMid) {
-            bestDistFromMid = dist;
-            midBridgeIndex = i;
-          }
-        }
+    // If current track is using plain lyrics (AUTO-SYNC), upgrade immediately to DTW/Viterbi FORCED-ALIGN!
+    if (isPredictedSync && currentLyricsData && currentLyricsData.type === 'plain' && currentASRSegments.length > 0) {
+      const targetDur = getExpectedTrackDuration(awaitingVideoReset) || detail.duration || 180;
+      const aligned = alignLyrics(currentLyricsData.lyrics, targetDur, currentASRSegments);
+      if (aligned.lines.length > 0) {
+        parsedLyrics = aligned.lines;
+        alignmentModeLabel = aligned.mode;
+        activeIndex = -2;
+        updateBadgeDisplay();
       }
     }
-
-    let totalWeight = 0;
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].hasStanzaBreakBefore) {
-        items[i].pauseWeightBefore = (i === midBridgeIndex) ? 8.5 : 2.2;
-      }
-      totalWeight += items[i].pauseWeightBefore + items[i].lineWeight;
-    }
-
-    const introTime = Math.min(15, Math.max(5.5, dur * 0.08));
-    const outroTime = Math.min(15, Math.max(6, dur * 0.08));
-    const activeSingingSpan = Math.max(25, dur - introTime - outroTime);
-    const scale = activeSingingSpan / (totalWeight || 1);
-
-    let cursorTime = introTime;
-    const predicted = [];
-
-    for (const item of items) {
-      cursorTime += item.pauseWeightBefore * scale;
-      predicted.push({
-        time: Math.round(cursorTime * 100) / 100,
-        text: item.text
-      });
-      cursorTime += item.lineWeight * scale;
-    }
-
-    return predicted;
-  }
+  });
 
   /**
-   * Remove common noise from song titles (e.g. 'Official Video', 'Remastered', 'En Vivo', etc.)
+   * Update status badge label & style according to active mode and offset.
    */
-  function cleanTrackTitle(title) {
-    return title
-      .replace(/\s*[\(\[](?:official\s*(?:video|music\s*video|audio|lyric\s*video)?|video\s*oficial|audio\s*oficial|video|audio|remastered|explicit|hd|4k|en\s*vivo|en\s*directo|live)[^\)\]]*[\)\]]/gi, '')
-      .replace(/\s*-\s*(?:official\s*video|audio|video|en\s*vivo|live)/gi, '')
-      .trim();
-  }
+  function updateBadgeDisplay() {
+    if (!statusBadgeEl || !isSynced) return;
 
-  /**
-   * Separate primary artist from collaborations (e.g. "Artist 1, Artist 2 y Artist 3" -> primary: "Artist 1")
-   */
-  function extractArtists(artistString) {
-    let base = artistString || '';
-    if (base.includes('•')) base = base.split('•')[0].trim();
-    if (base.includes('·')) base = base.split('·')[0].trim();
-
-    // Primary artist before comma, &, y, and, ft., feat.
-    const primary = base.split(/[,&]|\s+(?:y|and|feat\.?|ft\.?)\s+/i)[0].trim();
-    return { full: base, primary: primary || base };
-  }
-
-  /**
-   * Locate the active lyrics description shelf specifically inside ytmusic-player-page
-   * (never match album/artist description shelves on background browse pages).
-   */
-  function getPlayerLyricsShelf() {
-    const shelves = document.querySelectorAll(
-      'ytmusic-player-page ytmusic-tab-renderer ytmusic-description-shelf-renderer, ' +
-      'ytmusic-player-page ytmusic-description-shelf-renderer'
+    statusBadgeEl.className = 'lyrics-status-badge ' + (
+      !isPredictedSync ? 'synced' : (alignmentModeLabel === 'FORCED-ALIGN' ? 'forced' : 'predicted')
     );
-    if (!shelves || shelves.length === 0) return null;
 
-    for (const s of shelves) {
-      if (s.offsetParent !== null) return s;
+    if (syncOffset === 0) {
+      statusBadgeEl.textContent = isPredictedSync ? alignmentModeLabel : 'SYNCED';
+      statusBadgeEl.title = isPredictedSync
+        ? 'Click any lyric line when sung to anchor Forced Alignment to that exact second.'
+        : '';
+    } else {
+      const sign = syncOffset > 0 ? '+' : '';
+      const shortPrefix = !isPredictedSync ? 'SYNC' : (alignmentModeLabel === 'FORCED-ALIGN' ? 'ALIGN' : 'AUTO');
+      statusBadgeEl.textContent = `${shortPrefix} (${sign}${syncOffset.toFixed(1)}s)`;
+      statusBadgeEl.title = 'Click to reset offset to 0s';
     }
-    return shelves[0];
-  }
-
-  /**
-   * Fallback: Extract native lyrics directly from YouTube Music's player lyrics DOM.
-   */
-  function getNativeYTMLyrics() {
-    const shelf = getPlayerLyricsShelf();
-    if (!shelf) return null;
-
-    const descriptions = shelf.querySelectorAll(
-      'yt-formatted-string.non-expandable.description, yt-formatted-string.description, .description'
-    );
-    for (const el of descriptions) {
-      if (el && el.textContent) {
-        const text = el.textContent.trim();
-        if (text.length > 20 && !text.toLowerCase().includes('no lyrics available')) {
-          return text;
-        }
-      }
-    }
-    return null;
-  }
-
-  let lastBarSec = -1;
-  let lastBarSecTimestamp = 0;
-
-  /**
-   * Parse "mm:ss" or "hh:mm:ss" string into total seconds.
-   */
-  function parseTimeStringToSeconds(timeStr) {
-    if (!timeStr) return -1;
-    const parts = timeStr.trim().split(':').map(n => parseInt(n, 10));
-    if (parts.some(isNaN)) return -1;
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    return -1;
-  }
-
-  /**
-   * Read the authoritative current playback time and total duration displayed in YouTube Music's player bar.
-   */
-  function getPlayerBarTimeAndDuration() {
-    const timeInfoEl = document.querySelector('ytmusic-player-bar .time-info');
-    if (timeInfoEl && timeInfoEl.textContent) {
-      const parts = timeInfoEl.textContent.split('/');
-      if (parts.length === 2) {
-        const current = parseTimeStringToSeconds(parts[0]);
-        const total = parseTimeStringToSeconds(parts[1]);
-        if (current >= 0 && total > 0) {
-          return { current, total, valid: true };
-        }
-      }
-    }
-
-    const slider = document.querySelector('ytmusic-player-bar #progress-bar');
-    if (slider) {
-      const current = Number(slider.value ?? slider.getAttribute('value') ?? -1);
-      const total = Number(slider.max ?? slider.getAttribute('aria-valuemax') ?? 0);
-      if (current >= 0 && total > 0) {
-        return { current, total, valid: true };
-      }
-    }
-
-    return { current: 0, total: 0, valid: false };
-  }
-
-  /**
-   * Locate the active HTML5 <video> element inside YouTube Music's player.
-   */
-  function getActiveVideo() {
-    const videos = document.querySelectorAll('#movie_player video.html5-main-video, #movie_player video, ytmusic-player video, video');
-    if (!videos || videos.length === 0) return null;
-
-    for (const v of videos) {
-      if (!v.paused && v.readyState >= 2) return v;
-    }
-    return videos[0];
-  }
-
-  /**
-   * Get the accurate playback timestamp in seconds for the current track.
-   * Cross-checks <video>.currentTime against the player bar clock (.time-info / #progress-bar)
-   * so gapless MSE timeline offsets or stale <video> elements on automatic track transitions
-   * never jump the lyrics to the end of the song.
-   */
-  function getAccuratePlaybackTime() {
-    const video = getActiveVideo();
-    const bar = getPlayerBarTimeAndDuration();
-
-    if (bar.valid) {
-      if (bar.current !== lastBarSec) {
-        lastBarSec = bar.current;
-        lastBarSecTimestamp = performance.now();
-      }
-
-      // If <video>.currentTime agrees with the player bar clock within 2 seconds, use it for sub-second precision
-      if (video && !isNaN(video.currentTime) && Math.abs(video.currentTime - bar.current) <= 2.0) {
-        return video.currentTime;
-      }
-
-      // Otherwise (MSE cumulative offset or stale <video> element), interpolate smoothly from the player bar clock
-      const isPlaying = video ? !video.paused : true;
-      const subSecond = isPlaying
-        ? Math.min(0.98, Math.max(0, (performance.now() - lastBarSecTimestamp) / 1000))
-        : 0;
-      return bar.current + subSecond;
-    }
-
-    return (video && !isNaN(video.currentTime)) ? video.currentTime : 0;
-  }
-
-  /**
-   * Get the accurate duration of the current song.
-   */
-  function getExpectedTrackDuration() {
-    // 1. Check the currently selected queue item (updates immediately on automatic transition)
-    const selectedQueueDurationEl = document.querySelector(
-      'ytmusic-player-queue-item[selected] .duration, ' +
-      'ytmusic-player-queue-item[play-button-state="playing"] .duration'
-    );
-    if (selectedQueueDurationEl && selectedQueueDurationEl.textContent) {
-      const qSec = parseTimeStringToSeconds(selectedQueueDurationEl.textContent);
-      if (qSec > 0) return qSec;
-    }
-
-    // 2. Check player bar total time
-    const bar = getPlayerBarTimeAndDuration();
-    if (bar.valid && bar.total > 0 && !awaitingVideoReset) {
-      return bar.total;
-    }
-
-    // 3. Fallback to video.duration
-    const video = getActiveVideo();
-    if (video && !isNaN(video.duration) && video.duration > 0 && !awaitingVideoReset) {
-      return video.duration;
-    }
-
-    return 0;
-  }
-
-  /**
-   * Pick the best synced or plain lyrics from an LRCLIB result list for a given targetDuration.
-   */
-  function pickBestLyricsFromResults(results, targetDuration) {
-    if (!Array.isArray(results) || results.length === 0) return null;
-
-    // 1. Prioritize synced lyrics
-    const withSynced = results.filter(item => item.syncedLyrics && item.syncedLyrics.trim().length > 0);
-    if (withSynced.length > 0) {
-      if (targetDuration && targetDuration > 0) {
-        withSynced.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
-      }
-      return {
-        type: 'synced',
-        lyrics: withSynced[0].syncedLyrics,
-        duration: withSynced[0].duration || 0,
-        id: withSynced[0].id,
-        source: 'lrclib'
-      };
-    }
-
-    // 2. Fallback to plain lyrics
-    const withPlain = results.filter(item => item.plainLyrics && item.plainLyrics.trim().length > 0);
-    if (withPlain.length > 0) {
-      if (targetDuration && targetDuration > 0) {
-        withPlain.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
-      }
-      return {
-        type: 'plain',
-        lyrics: withPlain[0].plainLyrics,
-        duration: withPlain[0].duration || 0,
-        id: withPlain[0].id,
-        source: 'lrclib'
-      };
-    }
-
-    return null;
-  }
-
-  /**
-   * Fetch synced or plain lyrics from LRCLIB using smart cascaded queries and duration matching.
-   */
-  async function fetchLyrics(track, rawArtist, targetDuration) {
-    const { full: fullArtist, primary: primaryArtist } = extractArtists(rawArtist);
-    const cleanedTitle = cleanTrackTitle(track);
-
-    const searchApi = (url) => {
-      return new Promise((resolve) => {
-        try {
-          chrome.runtime.sendMessage({ type: 'FETCH_API', url }, (res) => {
-            if (chrome.runtime.lastError || !res || !res.success) {
-              resolve(null);
-            } else {
-              resolve(res.data);
-            }
-          });
-        } catch (e) {
-          console.warn('[YTM Sync Lyrics] Message passing failed:', e);
-          resolve(null);
-        }
-      });
-    };
-
-    // Cascade of query attempts in priority order:
-    const queryUrls = [
-      // Step 1: Cleaned title + primary artist (vital for songs with collaborations like "Los Principios")
-      `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanedTitle)}&artist_name=${encodeURIComponent(primaryArtist)}`,
-      // Step 2: Cleaned title + full artist
-      `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanedTitle)}&artist_name=${encodeURIComponent(fullArtist)}`,
-      // Step 3: Raw title + primary artist
-      `https://lrclib.net/api/search?track_name=${encodeURIComponent(track)}&artist_name=${encodeURIComponent(primaryArtist)}`,
-      // Step 4: Free-text search: cleaned title + primary artist
-      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${primaryArtist}`)}`,
-      // Step 5: Free-text search: cleaned title + full artist
-      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${fullArtist}`)}`
-    ];
-
-    const seen = new Set();
-    for (const url of queryUrls) {
-      if (seen.has(url)) continue;
-      seen.add(url);
-
-      const results = await searchApi(url);
-      const match = pickBestLyricsFromResults(results, targetDuration);
-      if (match) {
-        currentLRCLIBResults = results;
-        return match;
-      }
-    }
-
-    // Step 6: Native YouTube Music lyrics fallback from DOM
-    const nativeLyrics = getNativeYTMLyrics();
-    if (nativeLyrics) {
-      return { type: 'plain', lyrics: nativeLyrics, source: 'ytm' };
-    }
-
-    return null;
   }
 
   /**
@@ -443,14 +137,12 @@
    * Mount or update embedded lyrics container inside YouTube Music's native player lyrics shelf.
    */
   function ensureEmbeddedContainer() {
-    // Clean up any old floating viewport if still in DOM
     const oldFloating = document.getElementById('lyrics-viewport');
     if (oldFloating) oldFloating.remove();
 
     const shelf = getPlayerLyricsShelf();
     if (!shelf) return false;
 
-    // Mark this specific shelf as active and hide all native description elements
     shelf.classList.add('ytm-lyrics-active-shelf');
     shelf.querySelectorAll('.description').forEach((el) => {
       el.style.setProperty('display', 'none', 'important');
@@ -478,7 +170,6 @@
         <div id="ytm-embedded-scroll-box"></div>
       `;
 
-      // Always prepend directly as a top-level child of shelf (never inside a hidden expandable-description wrapper)
       shelf.prepend(container);
 
       embeddedContainerEl = container;
@@ -486,49 +177,34 @@
       trackTitleEl = container.querySelector('.ytm-embedded-title');
       statusBadgeEl = container.querySelector('.lyrics-status-badge');
 
-      // Wire offset buttons
       const offsetDecBtn = container.querySelector('#lyrics-offset-dec');
       const offsetIncBtn = container.querySelector('#lyrics-offset-inc');
 
-      const updateOffsetBadge = () => {
-        if (!isSynced || !statusBadgeEl) return;
-        const baseLabel = isPredictedSync ? 'AUTO-SYNC' : 'SYNCED';
-        if (syncOffset === 0) {
-          statusBadgeEl.textContent = baseLabel;
-          statusBadgeEl.title = isPredictedSync
-            ? 'Predictive sync active. Click any line while it is sung to snap sync to it.'
-            : '';
-        } else {
-          const sign = syncOffset > 0 ? '+' : '';
-          statusBadgeEl.textContent = `${isPredictedSync ? 'AUTO' : 'SYNC'} (${sign}${syncOffset.toFixed(1)}s)`;
-          statusBadgeEl.title = 'Click to reset offset to 0s';
-        }
-      };
-
       offsetDecBtn.addEventListener('click', () => {
         syncOffset = Math.round((syncOffset - 0.5) * 10) / 10;
-        updateOffsetBadge();
+        activeIndex = -2;
+        updateBadgeDisplay();
       });
 
       offsetIncBtn.addEventListener('click', () => {
         syncOffset = Math.round((syncOffset + 0.5) * 10) / 10;
-        updateOffsetBadge();
+        activeIndex = -2;
+        updateBadgeDisplay();
       });
 
       statusBadgeEl.addEventListener('click', () => {
         if (syncOffset !== 0) {
           syncOffset = 0;
-          updateOffsetBadge();
+          activeIndex = -2;
+          updateBadgeDisplay();
         }
       });
 
-      // Wire font size buttons
       const fontDecBtn = container.querySelector('#lyrics-font-dec');
       const fontIncBtn = container.querySelector('#lyrics-font-inc');
       fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
       fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
 
-      // Handle manual scrolling: pause auto-scroll for 3.5 seconds
       const handleUserManualScroll = () => {
         isUserScrolling = true;
         clearTimeout(userScrollTimer);
@@ -540,7 +216,6 @@
       scrollBoxEl.addEventListener('wheel', handleUserManualScroll, { passive: true });
       scrollBoxEl.addEventListener('touchstart', handleUserManualScroll, { passive: true });
     } else {
-      // Ensure container is a direct child of the current active player shelf
       if (container.parentNode !== shelf) {
         shelf.prepend(container);
       }
@@ -578,9 +253,9 @@
   }
 
   /**
-   * Render synced or plain lyrics into the embedded container.
+   * Render synced or forced-aligned lyrics into the embedded container.
    */
-  function renderLyrics(data, title, artist) {
+  function renderLyrics(data, title) {
     currentLyricsData = data;
     ensureEmbeddedContainer();
     if (!scrollBoxEl) return;
@@ -609,30 +284,23 @@
     }
 
     if (data.type === 'plain') {
-      // Convert plain lyrics (PLAIN / YTM PLAIN) into predicted synchronized lyrics!
       isSynced = true;
       isPredictedSync = true;
-      const targetDur = getExpectedTrackDuration() || data.duration || 180;
+      const targetDur = getExpectedTrackDuration(awaitingVideoReset) || data.duration || 180;
       lastPredictedDuration = targetDur;
-      parsedLyrics = predictSyncedLyrics(data.lyrics, targetDur);
 
-      if (statusBadgeEl) {
-        statusBadgeEl.textContent = 'AUTO-SYNC';
-        statusBadgeEl.className = 'lyrics-status-badge predicted';
-        statusBadgeEl.title = 'Predictive sync active. Click any line while it is sung to snap sync to it.';
-      }
+      const aligned = alignLyrics(data.lyrics, targetDur, currentASRSegments);
+      parsedLyrics = aligned.lines;
+      alignmentModeLabel = aligned.mode;
       scrollBoxEl.classList.remove('plain-mode');
+      updateBadgeDisplay();
     } else {
-      // Exact LRC Synced Lyrics
       isSynced = true;
       isPredictedSync = false;
-      if (statusBadgeEl) {
-        statusBadgeEl.textContent = 'SYNCED';
-        statusBadgeEl.className = 'lyrics-status-badge synced';
-        statusBadgeEl.title = '';
-      }
+      alignmentModeLabel = 'SYNCED';
       scrollBoxEl.classList.remove('plain-mode');
       parsedLyrics = parseLRC(data.lyrics);
+      updateBadgeDisplay();
     }
 
     if (parsedLyrics.length === 0) {
@@ -653,21 +321,22 @@
       p.dataset.index = index;
       p.textContent = line.text;
       if (isPredictedSync) {
-        p.title = 'Click when sung to snap sync here (or Alt+Click to seek audio)';
+        p.title = 'Click when sung to anchor Forced Alignment here (or Alt+Click to seek audio)';
       }
 
       p.addEventListener('click', (e) => {
         if (isPredictedSync && !e.altKey) {
-          // Live Re-Anchor: snap prediction offset so this line aligns with the current playback time!
+          // Viterbi Piecewise Forward Re-Alignment from this exact line and current playback second!
           const currentAccurate = getAccuratePlaybackTime();
-          const lineTargetTime = parsedLyrics[index]?.time ?? line.time;
-          syncOffset = Math.round((lineTargetTime - currentAccurate) * 10) / 10;
-          isUserScrolling = false;
-          activeIndex = -2;
-          if (statusBadgeEl) {
-            const sign = syncOffset > 0 ? '+' : '';
-            statusBadgeEl.textContent = syncOffset === 0 ? 'AUTO-SYNC' : `AUTO (${sign}${syncOffset.toFixed(1)}s)`;
-            statusBadgeEl.title = 'Click to reset offset to 0s';
+          const dur = getExpectedTrackDuration(false) || lastPredictedDuration || 180;
+          const realigned = realignFromUserAnchor(currentLyricsData.lyrics, index, currentAccurate, dur);
+          if (realigned.length > 0) {
+            parsedLyrics = realigned;
+            syncOffset = 0;
+            alignmentModeLabel = 'FORCED-ALIGN';
+            isUserScrolling = false;
+            activeIndex = -2;
+            updateBadgeDisplay();
           }
           return;
         }
@@ -693,21 +362,17 @@
     scrollBoxEl.appendChild(fragment);
     scrollBoxEl.scrollTop = 0;
 
-    // Also reset outer tab-renderer scroll position if user had scrolled the outer tab
     const outerTabRenderer = document.querySelector('ytmusic-player-page #tab-renderer');
     if (outerTabRenderer) {
       outerTabRenderer.scrollTop = 0;
     }
 
-    // Use -2 sentinel so the very first frame (even when currentIndex is -1 during intro) forces a clean UI sync
     activeIndex = -2;
-
     startSyncLoop();
   }
 
   /**
-   * Bind lifecycle events directly to the HTML5 <video> element to catch automatic track transitions
-   * and update duration matching when the new stream metadata loads.
+   * Bind lifecycle events directly to the HTML5 <video> element.
    */
   function bindVideoListeners() {
     const video = getActiveVideo();
@@ -723,11 +388,10 @@
         scrollBoxEl.scrollTop = 0;
       }
 
-      // Re-verify track metadata in case player bar updated at the same time
+      window.dispatchEvent(new CustomEvent('ytm-lyrics-request-asr'));
       checkTrackChange();
 
-      // If LRCLIB returned multiple versions, re-pick using the now-accurate track duration
-      const trueDuration = getExpectedTrackDuration();
+      const trueDuration = getExpectedTrackDuration(false);
       if (currentLRCLIBResults && trueDuration > 0) {
         const betterMatch = pickBestLyricsFromResults(currentLRCLIBResults, trueDuration);
         if (betterMatch && currentLyricsData && betterMatch.id !== currentLyricsData.id) {
@@ -749,7 +413,7 @@
   }
 
   /**
-   * Main sync loop updating active line and smooth native container scrolling.
+   * Main 60fps sync loop updating active line and smooth native container scrolling.
    */
   function startSyncLoop() {
     if (syncAnimationFrameId) {
@@ -774,17 +438,18 @@
 
       const rawTime = getAccuratePlaybackTime();
 
-      // If running predictive sync and the true song duration becomes available, refine predicted timestamps
       if (isPredictedSync && currentLyricsData && currentLyricsData.lyrics) {
-        const liveDur = getExpectedTrackDuration();
+        const liveDur = getExpectedTrackDuration(awaitingVideoReset);
         if (liveDur > 30 && Math.abs(liveDur - lastPredictedDuration) > 2) {
           lastPredictedDuration = liveDur;
-          parsedLyrics = predictSyncedLyrics(currentLyricsData.lyrics, liveDur);
+          const aligned = alignLyrics(currentLyricsData.lyrics, liveDur, currentASRSegments);
+          parsedLyrics = aligned.lines;
+          alignmentModeLabel = aligned.mode;
           activeIndex = -2;
+          updateBadgeDisplay();
         }
       }
 
-      // Clear awaitingVideoReset once the new song stream resets currentTime near 0 (or timeout passes)
       if (awaitingVideoReset) {
         if (rawTime < 4 || (Date.now() - trackChangeTimestamp > 3000)) {
           awaitingVideoReset = false;
@@ -792,7 +457,6 @@
         }
       }
 
-      // Song loop/rewind detection: if clock jumped back > 2s, force sentinel -2 so active classes & scroll reset
       if (rawTime < lastVideoTime - 2) {
         awaitingVideoReset = false;
         isUserScrolling = false;
@@ -800,8 +464,6 @@
       }
       lastVideoTime = rawTime;
 
-      // If the player is still holding the end timestamp of the previous song while loading the next track,
-      // treat time as 0 so it never jumps to the bottom of the new lyrics!
       const effectiveRawTime = (awaitingVideoReset && rawTime > 5) ? 0 : rawTime;
       const currentTime = effectiveRawTime + syncOffset;
       let currentIndex = -1;
@@ -818,7 +480,6 @@
         activeIndex = currentIndex;
         const domLines = scrollBoxEl.getElementsByClassName('lyric-line');
 
-        // Update active class
         for (let i = 0; i < domLines.length; i++) {
           if (i === activeIndex) {
             domLines[i].classList.add('active');
@@ -827,7 +488,6 @@
           }
         }
 
-        // Native smooth container scrolling (only if user is not actively scrolling manually)
         if (!isUserScrolling) {
           if (activeIndex !== -1 && domLines[activeIndex]) {
             const activeLine = domLines[activeIndex];
@@ -858,14 +518,12 @@
    * Switch YouTube Music to native LETRA tab when bottom shortcut button is clicked.
    */
   function openYTMLyricsTab() {
-    // 1. Expand player page if not already expanded
     const expandBtn = document.querySelector('ytmusic-player-bar .image, ytmusic-player-bar #thumbnail');
     const playerPage = document.querySelector('ytmusic-player-page');
     if (playerPage && playerPage.hasAttribute('player-page-open') === false && expandBtn) {
       expandBtn.click();
     }
 
-    // 2. Click the LETRA (Lyrics) tab
     setTimeout(() => {
       const tabs = document.querySelectorAll('ytmusic-player-page tp-yt-paper-tab');
       if (tabs && tabs.length >= 2) {
@@ -919,16 +577,14 @@
 
     const songKey = `${title}:::${artist}`;
     if (songKey === currentSongKey) {
-      // Re-mount if player shelf was re-created or switched in DOM
       const shelf = getPlayerLyricsShelf();
       const container = document.getElementById('ytm-embedded-lyrics-container');
       if (shelf && (!container || container.parentNode !== shelf)) {
-        renderLyrics(currentLyricsData, currentTitle, currentArtist);
+        renderLyrics(currentLyricsData, currentTitle);
       }
       return;
     }
 
-    // --- Song Transition: Reset state immediately ---
     activeRequestId++;
     const thisRequestId = activeRequestId;
 
@@ -937,6 +593,7 @@
     currentArtist = artist;
     currentLyricsData = null;
     currentLRCLIBResults = null;
+    currentASRSegments = [];
 
     if (syncAnimationFrameId) {
       cancelAnimationFrame(syncAnimationFrameId);
@@ -944,13 +601,14 @@
     }
 
     bindVideoListeners();
+    window.dispatchEvent(new CustomEvent('ytm-lyrics-request-asr'));
 
-    // If current time is still > 4s when the title changes, the player hasn't reset to 0s for the new track yet!
     trackChangeTimestamp = Date.now();
     awaitingVideoReset = Boolean(getAccuratePlaybackTime() > 4);
 
     parsedLyrics = [];
     isSynced = false;
+    isPredictedSync = false;
     activeIndex = -2;
     syncOffset = 0;
     isUserScrolling = false;
@@ -958,19 +616,19 @@
     injectToggleButton();
     renderLoadingState(title, artist);
 
-    // Fetch lyrics with accurate duration from selected queue item or video
-    const targetDuration = getExpectedTrackDuration();
-    const data = await fetchLyrics(title, artist, targetDuration);
+    const targetDuration = getExpectedTrackDuration(awaitingVideoReset);
+    const { match, rawResults } = await fetchLyrics(title, artist, targetDuration);
 
-    // Stale request guard: if song changed while fetching, discard this result!
     if (thisRequestId !== activeRequestId) return;
 
-    renderLyrics(data, title, artist);
+    currentLRCLIBResults = rawResults;
+    renderLyrics(match, title);
   }
 
   // --- Observer & Startup ---
   function initObserver() {
-    // Restore saved font size preference
+    injectPageBridge();
+
     chrome.storage.local.get(['lyricsFontSize'], (result) => {
       if (typeof result.lyricsFontSize === 'number') {
         setFontSize(result.lyricsFontSize, false);
@@ -979,7 +637,6 @@
 
     injectToggleButton();
 
-    // Keyboard shortcut (Alt + L) to open native lyrics tab
     window.addEventListener('keydown', (e) => {
       if (e.altKey && (e.key === 'l' || e.key === 'L')) {
         e.preventDefault();
@@ -987,7 +644,6 @@
       }
     });
 
-    // Observe player bar for track changes
     const playerBar = document.querySelector('ytmusic-player-bar');
     if (playerBar) {
       const observer = new MutationObserver(() => {
@@ -1014,7 +670,6 @@
       docObserver.observe(document.body, { childList: true, subtree: true });
     }
 
-    // Observe YTM tab content to inject embedded container when LETRA tab is open
     const tabObserver = new MutationObserver(() => {
       if (!currentSongKey) {
         checkTrackChange();
@@ -1031,13 +686,13 @@
                 currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
               }
             }
-            renderLyrics(currentLyricsData, currentTitle, currentArtist);
+            renderLyrics(currentLyricsData, currentTitle);
           }
         } else if (!currentLyricsData && statusBadgeEl && statusBadgeEl.textContent === 'NO LYRICS') {
           const native = getNativeYTMLyrics();
           if (native) {
             currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
-            renderLyrics(currentLyricsData, currentTitle, currentArtist);
+            renderLyrics(currentLyricsData, currentTitle);
           }
         }
       }
