@@ -410,11 +410,24 @@
       return false;
     }
 
-    // 2. First Vocal Onset Snap: When the singer enters for the first time, snap line 0 if unanchored
+    // 2. First Vocal Onset Snap: When the singer enters for the first time,
+    // anchor line 0 cleanly and taper the adjustment instead of shifting the entire song rigidly.
     if (vadState.triggeredPhraseOnset && vadState.firstVocalOnsetTime !== null && activeIndex <= 0 && !userAnchors[0]) {
       const onsetDelta = vadState.firstVocalOnsetTime - parsedLyrics[0].time;
       if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 18.0) {
-        shiftUnanchoredLinesFrom(parsedLyrics, 0, onsetDelta, userAnchors);
+        // Taper the shift over the first stanza (up to 6 lines) so an early producer tag
+        // or late intro doesn't drag the entire rest of the song out of alignment.
+        const taperCount = Math.min(parsedLyrics.length, 6);
+        for (let i = 0; i < taperCount; i++) {
+          if (Object.prototype.hasOwnProperty.call(userAnchors, i)) break;
+          const weight = 1 - (i / taperCount);
+          const minPrev = i > 0 ? (parsedLyrics[i - 1].time + 0.35) : 0.2;
+          const nextFixed = (i + 1 < parsedLyrics.length && i + 1 === taperCount)
+            ? parsedLyrics[i + 1].time - 0.35
+            : Infinity;
+          const shifted = Math.min(nextFixed, Math.max(minPrev, parsedLyrics[i].time + onsetDelta * weight));
+          parsedLyrics[i].time = Math.round(shifted * 100) / 100;
+        }
         return true;
       }
     }

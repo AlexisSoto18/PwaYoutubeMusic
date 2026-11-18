@@ -206,34 +206,35 @@
     const vocalFlux = Math.abs(vocalBandEnergy - prevVocalBandEnergy);
     prevVocalBandEnergy = vocalBandEnergy;
 
-    // Suppress pure bass thumps and hi-hat transients
-    const accompanimentPenalty = Math.max(0, (bassEnergy - vocalBandEnergy) * 0.25) + (highEnergy * 0.15);
-    const rawVocalSignal = Math.max(0, (vocalBandEnergy - accompanimentPenalty) * (0.75 + 0.5 * Math.min(1, harmonicCoverage * 2.2)));
+    // Suppress pure bass thumps, guitar/requinto body (bassEnergy), and hi-hat/pick transients
+    const accompanimentPenalty = Math.max(0, (bassEnergy - vocalBandEnergy * 0.85) * 0.35) + (highEnergy * 0.22);
+    const fluxBoost = Math.min(1.25, 0.8 + (vocalFlux * 0.08));
+    const rawVocalSignal = Math.max(0, (vocalBandEnergy - accompanimentPenalty) * (0.7 + 0.45 * Math.min(1, harmonicCoverage * 2.0)) * fluxBoost);
 
-    // Update adaptive rolling floor and peak
-    if (rawVocalSignal < rollingNoiseFloor + 6) {
-      rollingNoiseFloor = rollingNoiseFloor * 0.96 + rawVocalSignal * 0.04;
+    // Update adaptive rolling floor and peak (allow higher floor for loud mastered tracks)
+    if (rawVocalSignal < rollingNoiseFloor + 8) {
+      rollingNoiseFloor = rollingNoiseFloor * 0.94 + rawVocalSignal * 0.06;
     } else {
-      rollingNoiseFloor = rollingNoiseFloor * 0.996 + rawVocalSignal * 0.004;
+      rollingNoiseFloor = rollingNoiseFloor * 0.992 + rawVocalSignal * 0.008;
     }
-    rollingNoiseFloor = Math.max(10, Math.min(75, rollingNoiseFloor));
+    rollingNoiseFloor = Math.max(12, Math.min(130, rollingNoiseFloor));
 
     if (rawVocalSignal > rollingPeakVocal) {
-      rollingPeakVocal = rollingPeakVocal * 0.92 + rawVocalSignal * 0.08;
+      rollingPeakVocal = rollingPeakVocal * 0.90 + rawVocalSignal * 0.10;
     } else {
-      rollingPeakVocal = Math.max(rollingNoiseFloor + 20, rollingPeakVocal * 0.9985);
+      rollingPeakVocal = Math.max(rollingNoiseFloor + 22, rollingPeakVocal * 0.997);
     }
 
-    const dynamicRange = Math.max(16, rollingPeakVocal - rollingNoiseFloor);
+    const dynamicRange = Math.max(18, rollingPeakVocal - rollingNoiseFloor);
     const instantaneousScore = Math.max(0, Math.min(1, (rawVocalSignal - rollingNoiseFloor) / dynamicRange));
 
     // Smooth score with fast attack and moderate release
-    const alpha = instantaneousScore > smoothedVocalScore ? 0.35 : 0.16;
+    const alpha = instantaneousScore > smoothedVocalScore ? 0.35 : 0.18;
     smoothedVocalScore = smoothedVocalScore * (1 - alpha) + instantaneousScore * alpha;
 
     // Hysteresis thresholds for vocal activity
-    const onsetThreshold = 0.42;
-    const sustainThreshold = 0.27;
+    const onsetThreshold = 0.46;
+    const sustainThreshold = 0.31;
     const frameHasVoice = isVocalActive
       ? (smoothedVocalScore >= sustainThreshold)
       : (smoothedVocalScore >= onsetThreshold && harmonicCoverage >= 0.18 && vocalFlux >= 0.4);
