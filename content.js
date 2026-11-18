@@ -56,22 +56,55 @@
   }
 
   /**
-   * Remove common noise from song titles (e.g. 'Official Video', 'Remastered', etc.)
+   * Remove common noise from song titles (e.g. 'Official Video', 'Remastered', 'En Vivo', etc.)
    */
   function cleanTrackTitle(title) {
     return title
-      .replace(/\s*[\(\[](?:official\s*(?:video|music\s*video|audio|lyric\s*video)?|video|audio|remastered|explicit|hd|4k)[^\)\]]*[\)\]]/gi, '')
-      .replace(/\s*-\s*(?:official\s*video|audio|video)/gi, '')
+      .replace(/\s*[\(\[](?:official\s*(?:video|music\s*video|audio|lyric\s*video)?|video\s*oficial|audio\s*oficial|video|audio|remastered|explicit|hd|4k|en\s*vivo|en\s*directo|live)[^\)\]]*[\)\]]/gi, '')
+      .replace(/\s*-\s*(?:official\s*video|audio|video|en\s*vivo|live)/gi, '')
       .trim();
   }
 
   /**
-   * Fetch synced or plain lyrics from LRCLIB.
+   * Separate primary artist from collaborations (e.g. "Artist 1, Artist 2 y Artist 3" -> primary: "Artist 1")
    */
-  async function fetchLyricsFromLRCLIB(track, artist) {
-    const search = async (trackName, artistName) => {
+  function extractArtists(artistString) {
+    let base = artistString || '';
+    if (base.includes('•')) base = base.split('•')[0].trim();
+    if (base.includes('·')) base = base.split('·')[0].trim();
+
+    // Primary artist before comma, &, y, and, ft., feat.
+    const primary = base.split(/[,&]|\s+(?:y|and|feat\.?|ft\.?)\s+/i)[0].trim();
+    return { full: base, primary: primary || base };
+  }
+
+  /**
+   * Fallback: Extract native lyrics directly from YouTube Music's DOM if open or loaded.
+   */
+  function getNativeYTMLyrics() {
+    const el = document.querySelector(
+      'ytmusic-description-shelf-renderer yt-formatted-string.description, ' +
+      'ytmusic-description-shelf-renderer .description, ' +
+      'ytmusic-tab-renderer[page-type*="LYRICS"] .description'
+    );
+    if (el && el.textContent) {
+      const text = el.textContent.trim();
+      if (text.length > 20 && !text.toLowerCase().includes('no lyrics available')) {
+        return text;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Fetch synced or plain lyrics from LRCLIB using smart cascaded queries and duration matching.
+   */
+  async function fetchLyrics(track, rawArtist, targetDuration) {
+    const { full: fullArtist, primary: primaryArtist } = extractArtists(rawArtist);
+    const cleanedTitle = cleanTrackTitle(track);
+
+    const searchApi = async (url) => {
       try {
-        const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}`;
         const res = await fetch(url);
         if (!res.ok) return null;
         return await res.json();
@@ -81,39 +114,60 @@
       }
     };
 
-    // 1. Direct search
-    let results = await search(track, artist);
+    const pickBestLyrics = (results) => {
+      if (!Array.isArray(results) || results.length === 0) return null;
 
-    // 2. Fallback with cleaned title
-    if (!results || results.length === 0) {
-      const cleaned = cleanTrackTitle(track);
-      if (cleaned !== track) {
-        results = await search(cleaned, artist);
+      // 1. Prioritize synced lyrics
+      const withSynced = results.filter(item => item.syncedLyrics && item.syncedLyrics.trim().length > 0);
+      if (withSynced.length > 0) {
+        if (targetDuration && targetDuration > 0) {
+          withSynced.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
+        }
+        return { type: 'synced', lyrics: withSynced[0].syncedLyrics, source: 'lrclib' };
       }
+
+      // 2. Fallback to plain lyrics
+      const withPlain = results.filter(item => item.plainLyrics && item.plainLyrics.trim().length > 0);
+      if (withPlain.length > 0) {
+        if (targetDuration && targetDuration > 0) {
+          withPlain.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
+        }
+        return { type: 'plain', lyrics: withPlain[0].plainLyrics, source: 'lrclib' };
+      }
+
+      return null;
+    };
+
+    // Cascade of query attempts in priority order:
+    const queryUrls = [
+      // Step 1: Cleaned title + primary artist (vital for songs with collaborations like "Los Principios")
+      `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanedTitle)}&artist_name=${encodeURIComponent(primaryArtist)}`,
+      // Step 2: Cleaned title + full artist
+      `https://lrclib.net/api/search?track_name=${encodeURIComponent(cleanedTitle)}&artist_name=${encodeURIComponent(fullArtist)}`,
+      // Step 3: Raw title + primary artist
+      `https://lrclib.net/api/search?track_name=${encodeURIComponent(track)}&artist_name=${encodeURIComponent(primaryArtist)}`,
+      // Step 4: Free-text search: cleaned title + primary artist
+      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${primaryArtist}`)}`,
+      // Step 5: Free-text search: cleaned title + full artist
+      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${fullArtist}`)}`,
+      // Step 6: Free-text search: cleaned title only
+      `https://lrclib.net/api/search?q=${encodeURIComponent(cleanedTitle)}`
+    ];
+
+    const seen = new Set();
+    for (const url of queryUrls) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+
+      const results = await searchApi(url);
+      const match = pickBestLyrics(results);
+      if (match) return match;
     }
 
-    // 3. Fallback searching by general query string
-    if (!results || results.length === 0) {
-      try {
-        const query = `${cleanTrackTitle(track)} ${artist}`.trim();
-        const url = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
-        const res = await fetch(url);
-        if (res.ok) results = await res.json();
-      } catch (e) {
-        // Ignore fallback error
-      }
-    }
-
-    if (Array.isArray(results) && results.length > 0) {
-      const withSynced = results.find(item => item.syncedLyrics && item.syncedLyrics.trim().length > 0);
-      if (withSynced) {
-        return { type: 'synced', lyrics: withSynced.syncedLyrics };
-      }
-
-      const withPlain = results.find(item => item.plainLyrics && item.plainLyrics.trim().length > 0);
-      if (withPlain) {
-        return { type: 'plain', lyrics: withPlain.plainLyrics };
-      }
+    // Step 7: Native YouTube Music lyrics fallback from DOM
+    const nativeLyrics = getNativeYTMLyrics();
+    if (nativeLyrics) {
+      return { type: 'plain', lyrics: nativeLyrics, source: 'ytm' };
     }
 
     return null;
@@ -483,7 +537,7 @@
 
     if (data.type === 'plain') {
       isSynced = false;
-      statusBadgeEl.textContent = 'PLAIN';
+      statusBadgeEl.textContent = data.source === 'ytm' ? 'YTM PLAIN' : 'PLAIN';
       statusBadgeEl.className = 'lyrics-status-badge';
       wrapperEl.classList.add('plain-mode');
       wrapperEl.style.transform = 'none';
@@ -644,7 +698,9 @@
     }
 
     // Fetch lyrics
-    const data = await fetchLyricsFromLRCLIB(title, artist);
+    const video = document.querySelector('video');
+    const targetDuration = video && !isNaN(video.duration) ? video.duration : 0;
+    const data = await fetchLyrics(title, artist, targetDuration);
     if (songKey === currentSongKey) {
       renderLyrics(data, title, artist);
     }
@@ -682,6 +738,19 @@
 
       docObserver.observe(document.body, { childList: true, subtree: true });
     }
+
+    // Dynamic fallback observer: if no lyrics found yet, watch for YTM native lyrics tab loading
+    const lyricsObserver = new MutationObserver(() => {
+      if (statusBadgeEl && statusBadgeEl.textContent === 'NO LYRICS') {
+        const native = getNativeYTMLyrics();
+        if (native && currentSongKey) {
+          const parts = currentSongKey.split(':::');
+          renderLyrics({ type: 'plain', lyrics: native, source: 'ytm' }, parts[0], parts[1] || '');
+        }
+      }
+    });
+
+    lyricsObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
   if (document.readyState === 'loading') {
