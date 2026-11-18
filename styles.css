@@ -1,119 +1,64 @@
 /* ==========================================================================
-   YTM Sync Lyrics - Glassmorphism Theme & Animations
+   YTM Sync Lyrics - Native Embedded Theme (Option A)
    ========================================================================== */
 
-:root {
-  --ytm-lyrics-bg: rgba(18, 18, 26, 0.45);
-  --ytm-lyrics-glow: rgba(0, 0, 0, 0.5);
-  --ytm-lyrics-accent: rgba(255, 255, 255, 0.95);
+/* 1. Hide native static plain-text lyrics from YouTube Music */
+ytmusic-description-shelf-renderer yt-formatted-string.description {
+  display: none !important;
 }
 
-/* 1. Main Viewport Panel */
-#lyrics-viewport {
-  position: fixed;
-  top: 9vh;
-  right: 32px;
-  width: 480px;
-  max-width: calc(100vw - 64px);
-  height: 76vh;
-  border-radius: 28px;
-  
-  /* Glassmorphism */
-  background: var(--ytm-lyrics-bg);
-  backdrop-filter: blur(35px) saturate(180%);
-  -webkit-backdrop-filter: blur(35px) saturate(180%);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 30px 60px var(--ytm-lyrics-glow);
-  
-  overflow: hidden;
-  z-index: 999999;
+/* 2. Embedded Synced Lyrics Container inside ytmusic-description-shelf-renderer */
+#ytm-embedded-lyrics-container {
   display: flex;
   flex-direction: column;
-  user-select: none;
-  
-  transition: opacity 0.35s cubic-bezier(0.2, 0.8, 0.2, 1),
-              transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1),
-              background 0.8s ease,
-              box-shadow 0.8s ease;
+  width: 100%;
+  height: calc(100vh - 280px);
+  min-height: 400px;
+  max-height: 850px;
+  position: relative;
+  box-sizing: border-box;
+  user-select: text;
 }
 
-#lyrics-viewport.lyrics-hidden {
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(24px) scale(0.96);
-}
-
-/* 2. Header Bar */
-.lyrics-header {
-  display: flex;
-  flex-direction: column;
-  padding: 10px 24px 12px 24px;
-  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.45) 0%, transparent 100%);
-  z-index: 10;
-  cursor: grab;
-  touch-action: none;
-}
-
-.lyrics-drag-handle {
-  width: 36px;
-  height: 4px;
-  background: rgba(255, 255, 255, 0.35);
-  border-radius: 2px;
-  margin: 0 auto 8px auto;
-  pointer-events: none;
-}
-
-.lyrics-header-row {
+/* 3. Embedded Header Controls */
+.ytm-embedded-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
+  padding: 8px 0 16px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 12px;
+  flex-shrink: 0;
 }
 
-.lyrics-header.grabbing {
-  cursor: grabbing;
-}
-
-.lyrics-meta {
+.ytm-embedded-meta {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  margin-right: 12px;
 }
 
-.lyrics-track-title {
+.ytm-embedded-title {
   color: #ffffff;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  font-size: 15px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
   font-weight: 700;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.lyrics-track-artist {
-  color: rgba(255, 255, 255, 0.65);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 2px;
-}
-
-.lyrics-header-actions {
+.ytm-embedded-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
 .lyrics-action-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 12px;
   color: rgba(255, 255, 255, 0.85);
-  padding: 3px 8px;
+  padding: 4px 10px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 11px;
   font-weight: 700;
@@ -123,7 +68,7 @@
 }
 
 .lyrics-action-btn:hover {
-  background: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.22);
   color: #ffffff;
   transform: scale(1.05);
 }
@@ -136,7 +81,7 @@
   text-transform: uppercase;
   padding: 4px 10px;
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.1);
   color: rgba(255, 255, 255, 0.85);
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
@@ -147,86 +92,54 @@
   border-color: rgba(76, 217, 100, 0.3);
 }
 
-.lyrics-close-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border: none;
-  border-radius: 50%;
-  color: #ffffff;
-  width: 30px;
-  height: 30px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 18px;
-  line-height: 1;
-  transition: background 0.2s, transform 0.15s;
-}
-
-.lyrics-close-btn:hover {
-  background: rgba(255, 255, 255, 0.25);
-  transform: scale(1.08);
-}
-
-/* 3. Scroll Viewport with Bottom Gradient Mask */
-.lyrics-scroll-container {
-  position: relative;
+/* 4. Scrollable Container (Natural native scrolling) */
+#ytm-embedded-scroll-box {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
+  padding: 10px 10px 45vh 0;
+  box-sizing: border-box;
+  scroll-behavior: smooth;
   
-  /* Natural mask: top is crisp (0% transparent gap), bottom fades gracefully */
+  /* Natural mask for bottom fading */
   mask-image: linear-gradient(
     to bottom,
     black 0%,
-    black 84%,
+    black 85%,
     transparent 100%
   );
   -webkit-mask-image: linear-gradient(
     to bottom,
     black 0%,
-    black 84%,
+    black 85%,
     transparent 100%
   );
 }
 
-.lyrics-scroll-container::-webkit-scrollbar {
-  display: none;
+/* Custom sleek scrollbar */
+#ytm-embedded-scroll-box::-webkit-scrollbar {
+  width: 6px;
 }
 
-/* 4. Lyrics Moving Wrapper */
-#lyrics-wrapper {
-  display: flex;
-  flex-direction: column;
-  padding: 18px 32px 50vh 32px;
-  box-sizing: border-box;
-  
-  /* Ultra-smooth cubic bezier */
-  transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
-  will-change: transform;
+#ytm-embedded-scroll-box::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
 }
 
-/* Plain mode without auto-centering offset */
-#lyrics-wrapper.plain-mode {
-  padding: 24px 32px;
-  transform: none !important;
-  transition: none;
+#ytm-embedded-scroll-box::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
 }
 
-/* 5. Lyric Lines (Natural mobile style, sharp & clean without artificial blur) */
+/* 5. Lyric Lines */
 .lyric-line {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-  font-size: var(--ytm-lyric-font-size, 27px);
+  font-size: var(--ytm-lyric-font-size, 26px);
   font-weight: 700;
-  line-height: 1.36;
-  color: rgba(255, 255, 255, 0.42);
-  margin: 16px 0;
+  line-height: 1.38;
+  color: rgba(255, 255, 255, 0.4);
+  margin: 18px 0;
   cursor: pointer;
-  
-  /* Natural crisp font, smooth color transition */
-  transition: color 0.35s ease;
+  transition: color 0.3s ease;
 }
 
 .lyric-line.active {
@@ -238,7 +151,7 @@
 }
 
 /* Plain mode lyrics */
-#lyrics-wrapper.plain-mode .lyric-line {
+#ytm-embedded-scroll-box.plain-mode .lyric-line {
   color: rgba(255, 255, 255, 0.88);
   font-size: 20px;
   line-height: 1.6;
@@ -251,24 +164,24 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 100%;
-  padding: 40px;
+  height: 280px;
+  padding: 20px;
   text-align: center;
   color: rgba(255, 255, 255, 0.65);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
 .lyrics-empty-icon {
-  font-size: 42px;
-  margin-bottom: 16px;
-  opacity: 0.7;
+  font-size: 38px;
+  margin-bottom: 12px;
+  opacity: 0.75;
 }
 
 .lyrics-empty-title {
-  font-size: 19px;
+  font-size: 18px;
   font-weight: 700;
   color: #ffffff;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .lyrics-empty-desc {
@@ -277,7 +190,7 @@
   max-width: 320px;
 }
 
-/* 7. Toggle Button injected into YTM Player Bar */
+/* 7. Player bar shortcut button */
 #ytm-sync-lyrics-toggle {
   background: transparent;
   border: none;
@@ -291,7 +204,6 @@
   color: #909090;
   transition: all 0.2s ease;
   margin: 0 4px;
-  position: relative;
 }
 
 #ytm-sync-lyrics-toggle:hover {
@@ -301,7 +213,6 @@
 
 #ytm-sync-lyrics-toggle.active {
   color: #ffffff;
-  background: rgba(255, 255, 255, 0.2);
 }
 
 #ytm-sync-lyrics-toggle svg {

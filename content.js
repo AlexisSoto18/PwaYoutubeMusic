@@ -1,6 +1,6 @@
 /**
  * YTM Sync Lyrics - Content Script
- * Beautiful glassmorphism synchronized lyrics for YouTube Music Desktop / PWA.
+ * Native Embedded Synchronized Lyrics for YouTube Music Desktop & PWA.
  */
 
 (() => {
@@ -8,21 +8,24 @@
 
   // --- State ---
   let currentSongKey = '';
+  let currentTitle = '';
+  let currentArtist = '';
+  let currentLyricsData = null;
   let parsedLyrics = [];
   let isSynced = false;
   let activeIndex = -1;
   let syncOffset = 0;
   let syncAnimationFrameId = null;
-  let userScrollingTimer = null;
+  let userScrollTimer = null;
   let isUserScrolling = false;
-  let isPanelVisible = true;
+  let activeRequestId = 0;
+  let lastVideoTime = 0;
+  let currentFontSize = 26;
 
   // --- Elements Cache ---
-  let viewportEl = null;
-  let scrollContainerEl = null;
-  let wrapperEl = null;
+  let embeddedContainerEl = null;
+  let scrollBoxEl = null;
   let trackTitleEl = null;
-  let trackArtistEl = null;
   let statusBadgeEl = null;
   let toggleBtnEl = null;
 
@@ -79,7 +82,7 @@
   }
 
   /**
-   * Fallback: Extract native lyrics directly from YouTube Music's DOM if open or loaded.
+   * Fallback: Extract native lyrics directly from YouTube Music's DOM.
    */
   function getNativeYTMLyrics() {
     const el = document.querySelector(
@@ -174,391 +177,219 @@
   }
 
   /**
-   * Extract dominant RGB color from the album artwork without CORS canvas taint.
+   * Set font size with persistence.
    */
-  async function extractDominantColor(imageUrl) {
-    if (!imageUrl) return null;
-
-    try {
-      const response = await fetch(imageUrl);
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
-
-      return new Promise((resolve) => {
-        const img = new Image();
-        img.onload = () => {
-          URL.revokeObjectURL(blobUrl);
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d', { willReadFrequently: true });
-          canvas.width = 48;
-          canvas.height = 48;
-          ctx.drawImage(img, 0, 0, 48, 48);
-
-          try {
-            const { data } = ctx.getImageData(0, 0, 48, 48);
-            let r = 0, g = 0, b = 0, count = 0;
-            for (let i = 0; i < data.length; i += 16) {
-              r += data[i];
-              g += data[i + 1];
-              b += data[i + 2];
-              count++;
-            }
-
-            if (count > 0) {
-              r = Math.min(255, Math.floor((r / count) * 1.1));
-              g = Math.min(255, Math.floor((g / count) * 1.1));
-              b = Math.min(255, Math.floor((b / count) * 1.1));
-              resolve({ r, g, b });
-              return;
-            }
-          } catch (e) {
-            console.warn('[YTM Sync Lyrics] Error reading canvas pixels:', e);
-          }
-          resolve(null);
-        };
-
-        img.onerror = () => {
-          URL.revokeObjectURL(blobUrl);
-          resolve(null);
-        };
-
-        img.src = blobUrl;
-      });
-    } catch (err) {
-      console.warn('[YTM Sync Lyrics] Dominant color extraction failed:', err);
-      return null;
+  function setFontSize(size, save = true) {
+    currentFontSize = Math.max(16, Math.min(44, size));
+    if (embeddedContainerEl) {
+      embeddedContainerEl.style.setProperty('--ytm-lyric-font-size', `${currentFontSize}px`);
+    }
+    if (save) {
+      chrome.storage.local.set({ lyricsFontSize: currentFontSize });
     }
   }
 
   /**
-   * Apply dynamic background theme based on artwork dominant color.
+   * Mount or update embedded lyrics container inside YouTube Music's native lyrics shelf.
    */
-  function applyColorTheme(color) {
-    if (!viewportEl) return;
+  function ensureEmbeddedContainer() {
+    // Clean up any old floating viewport if still in DOM
+    const oldFloating = document.getElementById('lyrics-viewport');
+    if (oldFloating) oldFloating.remove();
 
-    if (color) {
-      const { r, g, b } = color;
-      const bg = `rgba(${r}, ${g}, ${b}, 0.42)`;
-      const glow = `rgba(${Math.max(0, r - 50)}, ${Math.max(0, g - 50)}, ${Math.max(0, b - 50)}, 0.55)`;
-      viewportEl.style.setProperty('--ytm-lyrics-bg', bg);
-      viewportEl.style.setProperty('--ytm-lyrics-glow', glow);
-    } else {
-      viewportEl.style.removeProperty('--ytm-lyrics-bg');
-      viewportEl.style.removeProperty('--ytm-lyrics-glow');
+    const shelf = document.querySelector('ytmusic-description-shelf-renderer');
+    if (!shelf) return false;
+
+    // Hide native description string
+    const nativeDesc = shelf.querySelector('.description');
+    if (nativeDesc) {
+      nativeDesc.style.setProperty('display', 'none', 'important');
     }
-  }
 
-  /**
-   * Create and mount the UI panel in the DOM.
-   */
-  function initLyricsUI() {
-    if (document.getElementById('lyrics-viewport')) return;
+    let container = document.getElementById('ytm-embedded-lyrics-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'ytm-embedded-lyrics-container';
+      container.style.setProperty('--ytm-lyric-font-size', `${currentFontSize}px`);
 
-    viewportEl = document.createElement('div');
-    viewportEl.id = 'lyrics-viewport';
-
-    viewportEl.innerHTML = `
-      <div class="lyrics-header">
-        <div class="lyrics-drag-handle"></div>
-        <div class="lyrics-header-row">
-          <div class="lyrics-meta">
-            <span class="lyrics-track-title">Waiting for music...</span>
-            <span class="lyrics-track-artist">YouTube Music</span>
+      container.innerHTML = `
+        <div class="ytm-embedded-header">
+          <div class="ytm-embedded-meta">
+            <span class="ytm-embedded-title">${currentTitle || 'Lyrics'}</span>
           </div>
-          <div class="lyrics-header-actions">
+          <div class="ytm-embedded-actions">
             <button class="lyrics-action-btn" id="lyrics-offset-dec" title="Delay lyrics (-0.5s)">-0.5s</button>
             <button class="lyrics-action-btn" id="lyrics-offset-inc" title="Advance lyrics (+0.5s)">+0.5s</button>
             <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
             <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
             <span class="lyrics-status-badge">STANDBY</span>
-            <button class="lyrics-close-btn" title="Close lyrics panel (Alt+L)">&times;</button>
           </div>
         </div>
-      </div>
-      <div class="lyrics-scroll-container">
-        <div id="lyrics-wrapper"></div>
-      </div>
-    `;
+        <div id="ytm-embedded-scroll-box"></div>
+      `;
 
-    document.body.appendChild(viewportEl);
-
-    scrollContainerEl = viewportEl.querySelector('.lyrics-scroll-container');
-    wrapperEl = document.getElementById('lyrics-wrapper');
-    trackTitleEl = viewportEl.querySelector('.lyrics-track-title');
-    trackArtistEl = viewportEl.querySelector('.lyrics-track-artist');
-    statusBadgeEl = viewportEl.querySelector('.lyrics-status-badge');
-
-    // Close button
-    const closeBtn = viewportEl.querySelector('.lyrics-close-btn');
-    closeBtn.addEventListener('click', () => togglePanelVisibility(false));
-
-    // Sync offset calibration controls
-    const updateSyncOffsetBadge = () => {
-      if (!isSynced) return;
-      if (syncOffset === 0) {
-        statusBadgeEl.textContent = 'SYNCED';
-        statusBadgeEl.title = '';
+      // Insert right before native description or at the beginning of shelf
+      if (nativeDesc) {
+        shelf.insertBefore(container, nativeDesc);
       } else {
-        const sign = syncOffset > 0 ? '+' : '';
-        statusBadgeEl.textContent = `${sign}${syncOffset.toFixed(1)}s`;
-        statusBadgeEl.title = 'Click to reset offset to 0s';
+        shelf.prepend(container);
       }
-    };
 
-    const offsetDecBtn = viewportEl.querySelector('#lyrics-offset-dec');
-    const offsetIncBtn = viewportEl.querySelector('#lyrics-offset-inc');
+      embeddedContainerEl = container;
+      scrollBoxEl = container.querySelector('#ytm-embedded-scroll-box');
+      trackTitleEl = container.querySelector('.ytm-embedded-title');
+      statusBadgeEl = container.querySelector('.lyrics-status-badge');
 
-    offsetDecBtn.addEventListener('click', () => {
-      syncOffset = Math.round((syncOffset - 0.5) * 10) / 10;
-      updateSyncOffsetBadge();
-    });
+      // Wire offset buttons
+      const offsetDecBtn = container.querySelector('#lyrics-offset-dec');
+      const offsetIncBtn = container.querySelector('#lyrics-offset-inc');
 
-    offsetIncBtn.addEventListener('click', () => {
-      syncOffset = Math.round((syncOffset + 0.5) * 10) / 10;
-      updateSyncOffsetBadge();
-    });
+      const updateOffsetBadge = () => {
+        if (!isSynced || !statusBadgeEl) return;
+        if (syncOffset === 0) {
+          statusBadgeEl.textContent = 'SYNCED';
+          statusBadgeEl.title = '';
+        } else {
+          const sign = syncOffset > 0 ? '+' : '';
+          statusBadgeEl.textContent = `${sign}${syncOffset.toFixed(1)}s`;
+          statusBadgeEl.title = 'Click to reset offset to 0s';
+        }
+      };
 
-    statusBadgeEl.addEventListener('click', () => {
-      if (syncOffset !== 0) {
-        syncOffset = 0;
-        updateSyncOffsetBadge();
-      }
-    });
+      offsetDecBtn.addEventListener('click', () => {
+        syncOffset = Math.round((syncOffset - 0.5) * 10) / 10;
+        updateOffsetBadge();
+      });
 
-    // Font size controls
-    let currentFontSize = 30;
-    const setFontSize = (size, save = true) => {
-      currentFontSize = Math.max(18, Math.min(46, size));
-      viewportEl.style.setProperty('--ytm-lyric-font-size', `${currentFontSize}px`);
-      if (save) {
-        chrome.storage.local.set({ lyricsFontSize: currentFontSize });
-      }
-    };
+      offsetIncBtn.addEventListener('click', () => {
+        syncOffset = Math.round((syncOffset + 0.5) * 10) / 10;
+        updateOffsetBadge();
+      });
 
-    const fontDecBtn = viewportEl.querySelector('#lyrics-font-dec');
-    const fontIncBtn = viewportEl.querySelector('#lyrics-font-inc');
-    fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
-    fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
-
-    // Enable drag & drop on header
-    const headerEl = viewportEl.querySelector('.lyrics-header');
-    setupPanelDragging(viewportEl, headerEl);
-
-    // Handle user manual scroll: temporarily disable auto-scroll snap
-    scrollContainerEl.addEventListener('wheel', () => {
-      isUserScrolling = true;
-      clearTimeout(userScrollingTimer);
-      userScrollingTimer = setTimeout(() => {
-        isUserScrolling = false;
-      }, 3500);
-    }, { passive: true });
-
-    // Restore saved visibility, position, and font size preferences
-    chrome.storage.local.get(['lyricsPanelVisible', 'lyricsPosition', 'lyricsFontSize'], (result) => {
-      if (typeof result.lyricsPanelVisible === 'boolean') {
-        togglePanelVisibility(result.lyricsPanelVisible, false);
-      }
-      if (result.lyricsPosition && viewportEl) {
-        viewportEl.style.right = 'auto';
-        viewportEl.style.left = result.lyricsPosition.left;
-        viewportEl.style.top = result.lyricsPosition.top;
-      }
-      if (typeof result.lyricsFontSize === 'number') {
-        setFontSize(result.lyricsFontSize, false);
-      }
-    });
-
-    // Keyboard shortcut (Alt + L) to toggle lyrics
-    window.addEventListener('keydown', (e) => {
-      if (e.altKey && (e.key === 'l' || e.key === 'L')) {
-        e.preventDefault();
-        togglePanelVisibility(!isPanelVisible);
-      }
-    });
-  }
-
-  /**
-   * Toggle panel visibility and persist state.
-   */
-  function togglePanelVisibility(show, save = true) {
-    isPanelVisible = show;
-    if (viewportEl) {
-      if (show) {
-        viewportEl.classList.remove('lyrics-hidden');
-      } else {
-        viewportEl.classList.add('lyrics-hidden');
-      }
-    }
-
-    if (toggleBtnEl) {
-      toggleBtnEl.classList.toggle('active', show);
-    }
-
-    if (save) {
-      chrome.storage.local.set({ lyricsPanelVisible: show });
-    }
-  }
-
-  /**
-   * Configure drag & drop mechanics and position persistence.
-   */
-  function setupPanelDragging(panel, handle) {
-    let isDragging = false;
-    let startX = 0;
-    let startY = 0;
-    let initialLeft = 0;
-    let initialTop = 0;
-
-    handle.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button')) return;
-
-      isDragging = true;
-      handle.classList.add('grabbing');
-
-      const rect = panel.getBoundingClientRect();
-      startX = e.clientX;
-      startY = e.clientY;
-      initialLeft = rect.left;
-      initialTop = rect.top;
-
-      panel.style.right = 'auto';
-      panel.style.left = `${initialLeft}px`;
-      panel.style.top = `${initialTop}px`;
-      panel.style.transition = 'opacity 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.8s ease, box-shadow 0.8s ease';
-
-      handle.setPointerCapture?.(e.pointerId);
-    });
-
-    window.addEventListener('pointermove', (e) => {
-      if (!isDragging) return;
-
-      const deltaX = e.clientX - startX;
-      const deltaY = e.clientY - startY;
-
-      let newLeft = initialLeft + deltaX;
-      let newTop = initialTop + deltaY;
-
-      const maxLeft = Math.max(10, window.innerWidth - panel.offsetWidth - 10);
-      const maxTop = Math.max(10, window.innerHeight - panel.offsetHeight - 10);
-
-      newLeft = Math.max(10, Math.min(newLeft, maxLeft));
-      newTop = Math.max(10, Math.min(newTop, maxTop));
-
-      panel.style.left = `${newLeft}px`;
-      panel.style.top = `${newTop}px`;
-    });
-
-    const stopDrag = () => {
-      if (!isDragging) return;
-      isDragging = false;
-      handle.classList.remove('grabbing');
-      panel.style.transition = '';
-
-      chrome.storage.local.set({
-        lyricsPosition: {
-          left: panel.style.left,
-          top: panel.style.top
+      statusBadgeEl.addEventListener('click', () => {
+        if (syncOffset !== 0) {
+          syncOffset = 0;
+          updateOffsetBadge();
         }
       });
-    };
 
-    window.addEventListener('pointerup', stopDrag);
-    window.addEventListener('pointercancel', stopDrag);
+      // Wire font size buttons
+      const fontDecBtn = container.querySelector('#lyrics-font-dec');
+      const fontIncBtn = container.querySelector('#lyrics-font-inc');
+      fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
+      fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
 
-    // Double-click on header to snap back to default top-right anchor
-    handle.addEventListener('dblclick', (e) => {
-      if (e.target.closest('button')) return;
-      panel.style.left = '';
-      panel.style.top = '9vh';
-      panel.style.right = '32px';
-      chrome.storage.local.remove('lyricsPosition');
-    });
+      // Handle manual scrolling: pause auto-scroll for 3.5 seconds
+      const handleUserManualScroll = () => {
+        isUserScrolling = true;
+        clearTimeout(userScrollTimer);
+        userScrollTimer = setTimeout(() => {
+          isUserScrolling = false;
+        }, 3500);
+      };
+
+      scrollBoxEl.addEventListener('wheel', handleUserManualScroll, { passive: true });
+      scrollBoxEl.addEventListener('touchstart', handleUserManualScroll, { passive: true });
+    } else {
+      embeddedContainerEl = container;
+      scrollBoxEl = container.querySelector('#ytm-embedded-scroll-box');
+      trackTitleEl = container.querySelector('.ytm-embedded-title');
+      statusBadgeEl = container.querySelector('.lyrics-status-badge');
+    }
+
+    return true;
   }
 
   /**
-   * Inject toggle button into YouTube Music player bar.
+   * Display loading/searching message in the embedded box.
    */
-  function injectToggleButton() {
-    if (document.getElementById('ytm-sync-lyrics-toggle')) return;
+  function renderLoadingState(title, artist) {
+    ensureEmbeddedContainer();
+    if (!scrollBoxEl) return;
 
-    const rightControls = document.querySelector('ytmusic-player-bar .right-controls-buttons');
-    if (!rightControls) return;
+    if (trackTitleEl) trackTitleEl.textContent = title;
+    if (statusBadgeEl) {
+      statusBadgeEl.textContent = 'SEARCHING...';
+      statusBadgeEl.className = 'lyrics-status-badge';
+    }
 
-    toggleBtnEl = document.createElement('button');
-    toggleBtnEl.id = 'ytm-sync-lyrics-toggle';
-    toggleBtnEl.title = 'Toggle Glass Lyrics (Alt+L)';
-    toggleBtnEl.setAttribute('aria-label', 'Toggle Glass Lyrics');
-    toggleBtnEl.innerHTML = `
-      <svg viewBox="0 0 24 24">
-        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6zm-2 16c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/>
-      </svg>
-    `;
-
-    if (isPanelVisible) toggleBtnEl.classList.add('active');
-
-    toggleBtnEl.addEventListener('click', () => {
-      togglePanelVisibility(!isPanelVisible);
-    });
-
-    rightControls.prepend(toggleBtnEl);
-  }
-
-  /**
-   * Display empty or loading state in the lyrics wrapper.
-   */
-  function renderMessage(title, description, icon = '🎵') {
-    if (!wrapperEl) return;
-    wrapperEl.classList.remove('plain-mode');
-    wrapperEl.style.transform = 'none';
-    wrapperEl.innerHTML = `
+    scrollBoxEl.classList.remove('plain-mode');
+    scrollBoxEl.innerHTML = `
       <div class="lyrics-empty-state">
-        <div class="lyrics-empty-icon">${icon}</div>
-        <div class="lyrics-empty-title">${title}</div>
-        <div class="lyrics-empty-desc">${description}</div>
+        <div class="lyrics-empty-icon">⏳</div>
+        <div class="lyrics-empty-title">Searching Lyrics</div>
+        <div class="lyrics-empty-desc">Looking up lyrics for ${title} by ${artist}...</div>
       </div>
     `;
+    scrollBoxEl.scrollTop = 0;
   }
 
   /**
-   * Render synced or plain lyrics into the wrapper.
+   * Render synced or plain lyrics into the embedded container.
    */
   function renderLyrics(data, title, artist) {
-    if (!wrapperEl) return;
+    currentLyricsData = data;
+    ensureEmbeddedContainer();
+    if (!scrollBoxEl) return;
 
-    trackTitleEl.textContent = title;
-    trackArtistEl.textContent = artist;
+    if (trackTitleEl) trackTitleEl.textContent = title;
 
     if (!data) {
-      statusBadgeEl.textContent = 'NO LYRICS';
-      statusBadgeEl.className = 'lyrics-status-badge';
-      renderMessage('No Lyrics Found', 'No synchronized lyrics found for this track on LRCLIB.', '🔍');
+      isSynced = false;
+      parsedLyrics = [];
+      activeIndex = -1;
+      if (statusBadgeEl) {
+        statusBadgeEl.textContent = 'NO LYRICS';
+        statusBadgeEl.className = 'lyrics-status-badge';
+      }
+      scrollBoxEl.classList.remove('plain-mode');
+      scrollBoxEl.innerHTML = `
+        <div class="lyrics-empty-state">
+          <div class="lyrics-empty-icon">🔍</div>
+          <div class="lyrics-empty-title">No Lyrics Found</div>
+          <div class="lyrics-empty-desc">No synchronized or plain lyrics found for this track.</div>
+        </div>
+      `;
+      scrollBoxEl.scrollTop = 0;
       return;
     }
 
     if (data.type === 'plain') {
       isSynced = false;
-      statusBadgeEl.textContent = data.source === 'ytm' ? 'YTM PLAIN' : 'PLAIN';
-      statusBadgeEl.className = 'lyrics-status-badge';
-      wrapperEl.classList.add('plain-mode');
-      wrapperEl.style.transform = 'none';
+      parsedLyrics = [];
+      activeIndex = -1;
+      if (statusBadgeEl) {
+        statusBadgeEl.textContent = data.source === 'ytm' ? 'YTM PLAIN' : 'PLAIN';
+        statusBadgeEl.className = 'lyrics-status-badge';
+      }
+      scrollBoxEl.classList.add('plain-mode');
 
       const lines = data.lyrics.split('\n');
-      wrapperEl.innerHTML = lines
+      scrollBoxEl.innerHTML = lines
         .map(line => `<p class="lyric-line">${line || '&nbsp;'}</p>`)
         .join('');
+      scrollBoxEl.scrollTop = 0;
       return;
     }
 
     // Synced Lyrics
     isSynced = true;
-    statusBadgeEl.textContent = 'SYNCED';
-    statusBadgeEl.className = 'lyrics-status-badge synced';
-    wrapperEl.classList.remove('plain-mode');
+    if (statusBadgeEl) {
+      statusBadgeEl.textContent = 'SYNCED';
+      statusBadgeEl.className = 'lyrics-status-badge synced';
+    }
+    scrollBoxEl.classList.remove('plain-mode');
 
     parsedLyrics = parseLRC(data.lyrics);
 
     if (parsedLyrics.length === 0) {
-      renderMessage('Empty Lyrics', 'The lyrics file had no valid timestamped lines.', '⚠️');
+      scrollBoxEl.innerHTML = `
+        <div class="lyrics-empty-state">
+          <div class="lyrics-empty-icon">⚠️</div>
+          <div class="lyrics-empty-title">Empty Lyrics</div>
+          <div class="lyrics-empty-desc">The lyrics file contained no valid timestamped lines.</div>
+        </div>
+      `;
       return;
     }
 
@@ -569,7 +400,7 @@
       p.dataset.index = index;
       p.textContent = line.text;
 
-      // Click to seek in video
+      // Interactive Click to Seek
       p.addEventListener('click', () => {
         const video = document.querySelector('video');
         if (video) {
@@ -580,16 +411,16 @@
       fragment.appendChild(p);
     });
 
-    wrapperEl.innerHTML = '';
-    wrapperEl.appendChild(fragment);
-    wrapperEl.style.transform = 'translateY(0px)';
+    scrollBoxEl.innerHTML = '';
+    scrollBoxEl.appendChild(fragment);
+    scrollBoxEl.scrollTop = 0;
     activeIndex = -1;
 
     startSyncLoop();
   }
 
   /**
-   * Main sync loop updating active line and vertical translation.
+   * Main sync loop updating active line and smooth native container scrolling.
    */
   function startSyncLoop() {
     if (syncAnimationFrameId) {
@@ -600,12 +431,23 @@
     const video = document.querySelector('video');
     if (!video) return;
 
+    lastVideoTime = video.currentTime;
+
     function update() {
-      if (!isSynced || parsedLyrics.length === 0 || !wrapperEl) {
+      if (!isSynced || parsedLyrics.length === 0 || !scrollBoxEl) {
         return;
       }
 
-      const currentTime = video.currentTime + syncOffset;
+      const rawTime = video.currentTime;
+
+      // Song loop/rewind detection: if video jumped back > 2s, reset scroll to top
+      if (rawTime < lastVideoTime - 2) {
+        activeIndex = -1;
+        scrollBoxEl.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+      lastVideoTime = rawTime;
+
+      const currentTime = rawTime + syncOffset;
       let currentIndex = -1;
 
       for (let i = 0; i < parsedLyrics.length; i++) {
@@ -618,7 +460,7 @@
 
       if (currentIndex !== activeIndex) {
         activeIndex = currentIndex;
-        const domLines = wrapperEl.getElementsByClassName('lyric-line');
+        const domLines = scrollBoxEl.getElementsByClassName('lyric-line');
 
         // Update active class
         for (let i = 0; i < domLines.length; i++) {
@@ -629,19 +471,23 @@
           }
         }
 
-        // Auto scroll translation calculation:
-        // Clamping with Math.min(0, ...) keeps the lyrics starting naturally at the top
-        // and only scrolling upward as the song progresses!
-        if (!isUserScrolling && scrollContainerEl) {
+        // Native smooth container scrolling (only if user is not actively scrolling manually)
+        if (!isUserScrolling) {
           if (activeIndex !== -1 && domLines[activeIndex]) {
             const activeLine = domLines[activeIndex];
-            const targetAnchor = scrollContainerEl.clientHeight * 0.22;
+            const targetAnchor = scrollBoxEl.clientHeight * 0.22;
             const lineTop = activeLine.offsetTop;
-            const translateY = Math.min(0, targetAnchor - lineTop);
+            const targetScrollTop = Math.max(0, lineTop - targetAnchor);
 
-            wrapperEl.style.transform = `translateY(${translateY}px)`;
-          } else {
-            wrapperEl.style.transform = 'translateY(0px)';
+            scrollBoxEl.scrollTo({
+              top: targetScrollTop,
+              behavior: 'smooth'
+            });
+          } else if (activeIndex === -1) {
+            scrollBoxEl.scrollTo({
+              top: 0,
+              behavior: 'smooth'
+            });
           }
         }
       }
@@ -653,7 +499,50 @@
   }
 
   /**
-   * Inspect player bar and detect song changes.
+   * Switch YouTube Music to native LETRA tab when bottom shortcut button is clicked.
+   */
+  function openYTMLyricsTab() {
+    // 1. Expand player page if not already expanded
+    const expandBtn = document.querySelector('ytmusic-player-bar .image, ytmusic-player-bar #thumbnail');
+    const playerPage = document.querySelector('ytmusic-player-page');
+    if (playerPage && playerPage.hasAttribute('player-page-open') === false && expandBtn) {
+      expandBtn.click();
+    }
+
+    // 2. Click the LETRA (Lyrics) tab
+    setTimeout(() => {
+      const tabs = document.querySelectorAll('ytmusic-player-page tp-yt-paper-tab');
+      if (tabs && tabs.length >= 2) {
+        tabs[1].click();
+      }
+    }, 100);
+  }
+
+  /**
+   * Inject shortcut button into YouTube Music player bar.
+   */
+  function injectToggleButton() {
+    if (document.getElementById('ytm-sync-lyrics-toggle')) return;
+
+    const rightControls = document.querySelector('ytmusic-player-bar .right-controls-buttons');
+    if (!rightControls) return;
+
+    toggleBtnEl = document.createElement('button');
+    toggleBtnEl.id = 'ytm-sync-lyrics-toggle';
+    toggleBtnEl.title = 'Open Synced Lyrics (Alt+L)';
+    toggleBtnEl.setAttribute('aria-label', 'Open Synced Lyrics');
+    toggleBtnEl.innerHTML = `
+      <svg viewBox="0 0 24 24">
+        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6zm-2 16c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/>
+      </svg>
+    `;
+
+    toggleBtnEl.addEventListener('click', openYTMLyricsTab);
+    rightControls.prepend(toggleBtnEl);
+  }
+
+  /**
+   * Inspect player bar and detect song changes with concurrency protection.
    */
   async function checkTrackChange() {
     const titleEl = document.querySelector('ytmusic-player-bar yt-formatted-string.title, ytmusic-player-bar .title');
@@ -664,7 +553,6 @@
     const title = titleEl.textContent?.trim() || '';
     let artist = artistEl.textContent?.trim() || '';
 
-    // Clean artist: take the first segment before bullet separator
     if (artist.includes('•')) {
       artist = artist.split('•')[0].trim();
     } else if (artist.includes('·')) {
@@ -674,44 +562,68 @@
     if (!title || !artist) return;
 
     const songKey = `${title}:::${artist}`;
-    if (songKey === currentSongKey) return;
+    if (songKey === currentSongKey) {
+      // Re-mount if shelf was re-created in DOM (e.g. user switched tabs)
+      if (document.querySelector('ytmusic-description-shelf-renderer') && !document.getElementById('ytm-embedded-lyrics-container')) {
+        renderLyrics(currentLyricsData, currentTitle, currentArtist);
+      }
+      return;
+    }
+
+    // --- Song Transition: Reset state immediately ---
+    activeRequestId++;
+    const thisRequestId = activeRequestId;
 
     currentSongKey = songKey;
+    currentTitle = title;
+    currentArtist = artist;
+    currentLyricsData = null;
+
+    if (syncAnimationFrameId) {
+      cancelAnimationFrame(syncAnimationFrameId);
+      syncAnimationFrameId = null;
+    }
+
+    parsedLyrics = [];
+    isSynced = false;
+    activeIndex = -1;
     syncOffset = 0;
-    initLyricsUI();
+    isUserScrolling = false;
+
     injectToggleButton();
+    renderLoadingState(title, artist);
 
-    // Show loading state
-    if (trackTitleEl) trackTitleEl.textContent = title;
-    if (trackArtistEl) trackArtistEl.textContent = artist;
-    if (statusBadgeEl) {
-      statusBadgeEl.textContent = 'SEARCHING...';
-      statusBadgeEl.className = 'lyrics-status-badge';
-    }
-    renderMessage('Searching Lyrics', `Fetching lyrics for ${title} by ${artist}...`, '⏳');
-
-    // Artwork & dominant color
-    const artEl = document.querySelector('ytmusic-player-bar img.image, ytmusic-player-bar #thumbnail img, ytmusic-player-bar img');
-    if (artEl && artEl.src) {
-      const highResUrl = artEl.src.replace(/w\d+-h\d+/, 'w500-h500');
-      extractDominantColor(highResUrl).then(applyColorTheme);
-    }
-
-    // Fetch lyrics
+    // Fetch lyrics with duration matching
     const video = document.querySelector('video');
     const targetDuration = video && !isNaN(video.duration) ? video.duration : 0;
     const data = await fetchLyrics(title, artist, targetDuration);
-    if (songKey === currentSongKey) {
-      renderLyrics(data, title, artist);
-    }
+
+    // Stale request guard: if song changed while fetching, discard this result!
+    if (thisRequestId !== activeRequestId) return;
+
+    renderLyrics(data, title, artist);
   }
 
   // --- Observer & Startup ---
   function initObserver() {
-    initLyricsUI();
+    // Restore saved font size preference
+    chrome.storage.local.get(['lyricsFontSize'], (result) => {
+      if (typeof result.lyricsFontSize === 'number') {
+        setFontSize(result.lyricsFontSize, false);
+      }
+    });
+
     injectToggleButton();
 
-    // Observe player bar for track mutations
+    // Keyboard shortcut (Alt + L) to open native lyrics tab
+    window.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        openYTMLyricsTab();
+      }
+    });
+
+    // Observe player bar for track changes
     const playerBar = document.querySelector('ytmusic-player-bar');
     if (playerBar) {
       const observer = new MutationObserver(() => {
@@ -727,7 +639,6 @@
 
       checkTrackChange();
     } else {
-      // Fallback: wait for player bar in document
       const docObserver = new MutationObserver((_, obs) => {
         const bar = document.querySelector('ytmusic-player-bar');
         if (bar) {
@@ -739,18 +650,22 @@
       docObserver.observe(document.body, { childList: true, subtree: true });
     }
 
-    // Dynamic fallback observer: if no lyrics found yet, watch for YTM native lyrics tab loading
-    const lyricsObserver = new MutationObserver(() => {
-      if (statusBadgeEl && statusBadgeEl.textContent === 'NO LYRICS') {
-        const native = getNativeYTMLyrics();
-        if (native && currentSongKey) {
-          const parts = currentSongKey.split(':::');
-          renderLyrics({ type: 'plain', lyrics: native, source: 'ytm' }, parts[0], parts[1] || '');
+    // Observe YTM tab content to inject embedded container when LETRA tab is open
+    const tabObserver = new MutationObserver(() => {
+      const shelf = document.querySelector('ytmusic-description-shelf-renderer');
+      if (shelf) {
+        const nativeDesc = shelf.querySelector('.description');
+        if (nativeDesc && nativeDesc.style.display !== 'none') {
+          nativeDesc.style.setProperty('display', 'none', 'important');
+        }
+
+        if (!document.getElementById('ytm-embedded-lyrics-container') && currentSongKey) {
+          renderLyrics(currentLyricsData, currentTitle, currentArtist);
         }
       }
     });
 
-    lyricsObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    tabObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   if (document.readyState === 'loading') {
