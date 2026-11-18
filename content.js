@@ -123,22 +123,96 @@
     return null;
   }
 
+  let lastBarSec = -1;
+  let lastBarSecTimestamp = 0;
+
   /**
    * Parse "mm:ss" or "hh:mm:ss" string into total seconds.
    */
   function parseTimeStringToSeconds(timeStr) {
-    if (!timeStr) return 0;
+    if (!timeStr) return -1;
     const parts = timeStr.trim().split(':').map(n => parseInt(n, 10));
-    if (parts.some(isNaN)) return 0;
+    if (parts.some(isNaN)) return -1;
     if (parts.length === 2) return parts[0] * 60 + parts[1];
     if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    return 0;
+    return -1;
+  }
+
+  /**
+   * Read the authoritative current playback time and total duration displayed in YouTube Music's player bar.
+   */
+  function getPlayerBarTimeAndDuration() {
+    const timeInfoEl = document.querySelector('ytmusic-player-bar .time-info');
+    if (timeInfoEl && timeInfoEl.textContent) {
+      const parts = timeInfoEl.textContent.split('/');
+      if (parts.length === 2) {
+        const current = parseTimeStringToSeconds(parts[0]);
+        const total = parseTimeStringToSeconds(parts[1]);
+        if (current >= 0 && total > 0) {
+          return { current, total, valid: true };
+        }
+      }
+    }
+
+    const slider = document.querySelector('ytmusic-player-bar #progress-bar');
+    if (slider) {
+      const current = Number(slider.value ?? slider.getAttribute('value') ?? -1);
+      const total = Number(slider.max ?? slider.getAttribute('aria-valuemax') ?? 0);
+      if (current >= 0 && total > 0) {
+        return { current, total, valid: true };
+      }
+    }
+
+    return { current: 0, total: 0, valid: false };
+  }
+
+  /**
+   * Locate the active HTML5 <video> element inside YouTube Music's player.
+   */
+  function getActiveVideo() {
+    const videos = document.querySelectorAll('#movie_player video.html5-main-video, #movie_player video, ytmusic-player video, video');
+    if (!videos || videos.length === 0) return null;
+
+    for (const v of videos) {
+      if (!v.paused && v.readyState >= 2) return v;
+    }
+    return videos[0];
+  }
+
+  /**
+   * Get the accurate playback timestamp in seconds for the current track.
+   * Cross-checks <video>.currentTime against the player bar clock (.time-info / #progress-bar)
+   * so gapless MSE timeline offsets or stale <video> elements on automatic track transitions
+   * never jump the lyrics to the end of the song.
+   */
+  function getAccuratePlaybackTime() {
+    const video = getActiveVideo();
+    const bar = getPlayerBarTimeAndDuration();
+
+    if (bar.valid) {
+      if (bar.current !== lastBarSec) {
+        lastBarSec = bar.current;
+        lastBarSecTimestamp = performance.now();
+      }
+
+      // If <video>.currentTime agrees with the player bar clock within 2 seconds, use it for sub-second precision
+      if (video && !isNaN(video.currentTime) && Math.abs(video.currentTime - bar.current) <= 2.0) {
+        return video.currentTime;
+      }
+
+      // Otherwise (MSE cumulative offset or stale <video> element), interpolate smoothly from the player bar clock
+      const isPlaying = video ? !video.paused : true;
+      const subSecond = isPlaying
+        ? Math.min(0.98, Math.max(0, (performance.now() - lastBarSecTimestamp) / 1000))
+        : 0;
+      return bar.current + subSecond;
+    }
+
+    return (video && !isNaN(video.currentTime)) ? video.currentTime : 0;
   }
 
   /**
    * Get the accurate duration of the current song.
-   * During automatic queue transitions, video.duration briefly holds the previous song's duration,
-   * whereas the selected queue item already has the true duration of the new song.
    */
   function getExpectedTrackDuration() {
     // 1. Check the currently selected queue item (updates immediately on automatic transition)
@@ -151,8 +225,14 @@
       if (qSec > 0) return qSec;
     }
 
-    // 2. Fallback to video.duration if valid and video is not still at the end of the previous track
-    const video = document.querySelector('video');
+    // 2. Check player bar total time
+    const bar = getPlayerBarTimeAndDuration();
+    if (bar.valid && bar.total > 0 && !awaitingVideoReset) {
+      return bar.total;
+    }
+
+    // 3. Fallback to video.duration
+    const video = getActiveVideo();
     if (video && !isNaN(video.duration) && video.duration > 0 && !awaitingVideoReset) {
       return video.duration;
     }
@@ -485,9 +565,15 @@
 
       // Interactive Click to Seek
       p.addEventListener('click', () => {
-        const video = document.querySelector('video');
+        const video = getActiveVideo();
         if (video) {
-          video.currentTime = line.time;
+          const currentAccurate = getAccuratePlaybackTime();
+          const delta = line.time - currentAccurate;
+          if (Math.abs(video.currentTime - currentAccurate) <= 2.5) {
+            video.currentTime = line.time;
+          } else {
+            video.currentTime = Math.max(0, video.currentTime + delta);
+          }
         }
       });
 
@@ -515,7 +601,7 @@
    * and update duration matching when the new stream metadata loads.
    */
   function bindVideoListeners() {
-    const video = document.querySelector('video');
+    const video = getActiveVideo();
     if (!video || video === boundVideoEl) return;
     boundVideoEl = video;
 
@@ -531,9 +617,10 @@
       // Re-verify track metadata in case player bar updated at the same time
       checkTrackChange();
 
-      // If LRCLIB returned multiple versions, re-pick using the now-accurate video.duration
-      if (currentLRCLIBResults && !isNaN(video.duration) && video.duration > 0) {
-        const betterMatch = pickBestLyricsFromResults(currentLRCLIBResults, video.duration);
+      // If LRCLIB returned multiple versions, re-pick using the now-accurate track duration
+      const trueDuration = getExpectedTrackDuration();
+      if (currentLRCLIBResults && trueDuration > 0) {
+        const betterMatch = pickBestLyricsFromResults(currentLRCLIBResults, trueDuration);
         if (betterMatch && currentLyricsData && betterMatch.id !== currentLyricsData.id) {
           renderLyrics(betterMatch, currentTitle, currentArtist);
         }
@@ -561,28 +648,32 @@
       syncAnimationFrameId = null;
     }
 
-    const video = document.querySelector('video');
-    if (!video) return;
-
     bindVideoListeners();
-    lastVideoTime = video.currentTime;
+    lastVideoTime = getAccuratePlaybackTime();
 
     function update() {
-      if (!isSynced || parsedLyrics.length === 0 || !scrollBoxEl) {
+      if (!isSynced || parsedLyrics.length === 0) {
         return;
       }
 
-      const rawTime = video.currentTime;
+      const liveScrollBox = document.getElementById('ytm-embedded-scroll-box') || scrollBoxEl;
+      if (!liveScrollBox) {
+        syncAnimationFrameId = requestAnimationFrame(update);
+        return;
+      }
+      scrollBoxEl = liveScrollBox;
+
+      const rawTime = getAccuratePlaybackTime();
 
       // Clear awaitingVideoReset once the new song stream resets currentTime near 0 (or timeout passes)
       if (awaitingVideoReset) {
-        if (rawTime < 3 || (Date.now() - trackChangeTimestamp > 3500)) {
+        if (rawTime < 4 || (Date.now() - trackChangeTimestamp > 3000)) {
           awaitingVideoReset = false;
           activeIndex = -2;
         }
       }
 
-      // Song loop/rewind detection: if video jumped back > 2s, force sentinel -2 so active classes & scroll reset
+      // Song loop/rewind detection: if clock jumped back > 2s, force sentinel -2 so active classes & scroll reset
       if (rawTime < lastVideoTime - 2) {
         awaitingVideoReset = false;
         isUserScrolling = false;
@@ -733,12 +824,11 @@
       syncAnimationFrameId = null;
     }
 
-    const video = document.querySelector('video');
     bindVideoListeners();
 
-    // If video.currentTime is still > 4s when the title changes, <video> hasn't reset to 0s for the new track yet!
+    // If current time is still > 4s when the title changes, the player hasn't reset to 0s for the new track yet!
     trackChangeTimestamp = Date.now();
-    awaitingVideoReset = Boolean(video && video.currentTime > 4);
+    awaitingVideoReset = Boolean(getAccuratePlaybackTime() > 4);
 
     parsedLyrics = [];
     isSynced = false;
