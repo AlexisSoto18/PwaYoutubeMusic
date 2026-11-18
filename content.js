@@ -14,6 +14,8 @@
   let currentLRCLIBResults = null;
   let parsedLyrics = [];
   let isSynced = false;
+  let isPredictedSync = false;
+  let lastPredictedDuration = 0;
   let activeIndex = -2;
   let syncOffset = 0;
   let syncAnimationFrameId = null;
@@ -60,6 +62,91 @@
     }
 
     return parsed.sort((a, b) => a.time - b.time);
+  }
+
+  /**
+   * Phonetic & Structural Prediction Algorithm for Plain Lyrics (PLAIN / YTM PLAIN).
+   * Estimates line timestamps by modeling:
+   * 1. Instrumental intro & outro margins (~8% of duration, clamped).
+   * 2. Phonetic syllable count per line (vowel clusters) + base phrase breath.
+   * 3. Stanza breaks (\n\n) and mid-song instrumental interlude (requinto/solo).
+   */
+  function predictSyncedLyrics(plainText, durationSeconds) {
+    if (!plainText) return [];
+    const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
+
+    const rawLines = plainText.split('\n');
+    const items = [];
+    let pendingStanzaBreak = false;
+
+    for (const raw of rawLines) {
+      const text = raw.trim();
+      if (!text) {
+        if (items.length > 0) {
+          pendingStanzaBreak = true;
+        }
+        continue;
+      }
+
+      // Count syllable clusters (Spanish/English vowels)
+      const syllables = (text.match(/[aeiouáéíóúü]+/gi) || []).length || 1;
+      const lineWeight = 1.35 + (syllables * 0.22);
+
+      items.push({
+        text,
+        lineWeight,
+        hasStanzaBreakBefore: pendingStanzaBreak,
+        pauseWeightBefore: 0
+      });
+      pendingStanzaBreak = false;
+    }
+
+    if (items.length === 0) return [];
+
+    // Identify the main mid-song instrumental interlude (stanza break closest to 50% of the song)
+    let midBridgeIndex = -1;
+    let bestDistFromMid = Infinity;
+    const midPoint = items.length * 0.5;
+
+    for (let i = 1; i < items.length; i++) {
+      if (items[i].hasStanzaBreakBefore) {
+        const ratio = i / items.length;
+        if (ratio >= 0.35 && ratio <= 0.68) {
+          const dist = Math.abs(i - midPoint);
+          if (dist < bestDistFromMid) {
+            bestDistFromMid = dist;
+            midBridgeIndex = i;
+          }
+        }
+      }
+    }
+
+    let totalWeight = 0;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].hasStanzaBreakBefore) {
+        items[i].pauseWeightBefore = (i === midBridgeIndex) ? 8.5 : 2.2;
+      }
+      totalWeight += items[i].pauseWeightBefore + items[i].lineWeight;
+    }
+
+    const introTime = Math.min(15, Math.max(5.5, dur * 0.08));
+    const outroTime = Math.min(15, Math.max(6, dur * 0.08));
+    const activeSingingSpan = Math.max(25, dur - introTime - outroTime);
+    const scale = activeSingingSpan / (totalWeight || 1);
+
+    let cursorTime = introTime;
+    const predicted = [];
+
+    for (const item of items) {
+      cursorTime += item.pauseWeightBefore * scale;
+      predicted.push({
+        time: Math.round(cursorTime * 100) / 100,
+        text: item.text
+      });
+      cursorTime += item.lineWeight * scale;
+    }
+
+    return predicted;
   }
 
   /**
@@ -405,12 +492,15 @@
 
       const updateOffsetBadge = () => {
         if (!isSynced || !statusBadgeEl) return;
+        const baseLabel = isPredictedSync ? 'AUTO-SYNC' : 'SYNCED';
         if (syncOffset === 0) {
-          statusBadgeEl.textContent = 'SYNCED';
-          statusBadgeEl.title = '';
+          statusBadgeEl.textContent = baseLabel;
+          statusBadgeEl.title = isPredictedSync
+            ? 'Predictive sync active. Click any line while it is sung to snap sync to it.'
+            : '';
         } else {
           const sign = syncOffset > 0 ? '+' : '';
-          statusBadgeEl.textContent = `${sign}${syncOffset.toFixed(1)}s`;
+          statusBadgeEl.textContent = `${isPredictedSync ? 'AUTO' : 'SYNC'} (${sign}${syncOffset.toFixed(1)}s)`;
           statusBadgeEl.title = 'Click to reset offset to 0s';
         }
       };
@@ -499,6 +589,7 @@
 
     if (!data) {
       isSynced = false;
+      isPredictedSync = false;
       parsedLyrics = [];
       activeIndex = -1;
       if (statusBadgeEl) {
@@ -518,39 +609,38 @@
     }
 
     if (data.type === 'plain') {
-      isSynced = false;
-      parsedLyrics = [];
-      activeIndex = -1;
+      // Convert plain lyrics (PLAIN / YTM PLAIN) into predicted synchronized lyrics!
+      isSynced = true;
+      isPredictedSync = true;
+      const targetDur = getExpectedTrackDuration() || data.duration || 180;
+      lastPredictedDuration = targetDur;
+      parsedLyrics = predictSyncedLyrics(data.lyrics, targetDur);
+
       if (statusBadgeEl) {
-        statusBadgeEl.textContent = data.source === 'ytm' ? 'YTM PLAIN' : 'PLAIN';
-        statusBadgeEl.className = 'lyrics-status-badge';
+        statusBadgeEl.textContent = 'AUTO-SYNC';
+        statusBadgeEl.className = 'lyrics-status-badge predicted';
+        statusBadgeEl.title = 'Predictive sync active. Click any line while it is sung to snap sync to it.';
       }
-      scrollBoxEl.classList.add('plain-mode');
-
-      const lines = data.lyrics.split('\n');
-      scrollBoxEl.innerHTML = lines
-        .map(line => `<p class="lyric-line">${line || '&nbsp;'}</p>`)
-        .join('');
-      scrollBoxEl.scrollTop = 0;
-      return;
+      scrollBoxEl.classList.remove('plain-mode');
+    } else {
+      // Exact LRC Synced Lyrics
+      isSynced = true;
+      isPredictedSync = false;
+      if (statusBadgeEl) {
+        statusBadgeEl.textContent = 'SYNCED';
+        statusBadgeEl.className = 'lyrics-status-badge synced';
+        statusBadgeEl.title = '';
+      }
+      scrollBoxEl.classList.remove('plain-mode');
+      parsedLyrics = parseLRC(data.lyrics);
     }
-
-    // Synced Lyrics
-    isSynced = true;
-    if (statusBadgeEl) {
-      statusBadgeEl.textContent = 'SYNCED';
-      statusBadgeEl.className = 'lyrics-status-badge synced';
-    }
-    scrollBoxEl.classList.remove('plain-mode');
-
-    parsedLyrics = parseLRC(data.lyrics);
 
     if (parsedLyrics.length === 0) {
       scrollBoxEl.innerHTML = `
         <div class="lyrics-empty-state">
           <div class="lyrics-empty-icon">⚠️</div>
           <div class="lyrics-empty-title">Empty Lyrics</div>
-          <div class="lyrics-empty-desc">The lyrics file contained no valid timestamped lines.</div>
+          <div class="lyrics-empty-desc">The lyrics file contained no valid lines.</div>
         </div>
       `;
       return;
@@ -562,15 +652,34 @@
       p.className = 'lyric-line';
       p.dataset.index = index;
       p.textContent = line.text;
+      if (isPredictedSync) {
+        p.title = 'Click when sung to snap sync here (or Alt+Click to seek audio)';
+      }
 
-      // Interactive Click to Seek
-      p.addEventListener('click', () => {
+      p.addEventListener('click', (e) => {
+        if (isPredictedSync && !e.altKey) {
+          // Live Re-Anchor: snap prediction offset so this line aligns with the current playback time!
+          const currentAccurate = getAccuratePlaybackTime();
+          const lineTargetTime = parsedLyrics[index]?.time ?? line.time;
+          syncOffset = Math.round((lineTargetTime - currentAccurate) * 10) / 10;
+          isUserScrolling = false;
+          activeIndex = -2;
+          if (statusBadgeEl) {
+            const sign = syncOffset > 0 ? '+' : '';
+            statusBadgeEl.textContent = syncOffset === 0 ? 'AUTO-SYNC' : `AUTO (${sign}${syncOffset.toFixed(1)}s)`;
+            statusBadgeEl.title = 'Click to reset offset to 0s';
+          }
+          return;
+        }
+
+        // Standard Click-to-Seek in exact SYNCED mode (or Alt+Click in AUTO-SYNC mode)
         const video = getActiveVideo();
         if (video) {
           const currentAccurate = getAccuratePlaybackTime();
-          const delta = line.time - currentAccurate;
+          const lineTargetTime = parsedLyrics[index]?.time ?? line.time;
+          const delta = lineTargetTime - currentAccurate;
           if (Math.abs(video.currentTime - currentAccurate) <= 2.5) {
-            video.currentTime = line.time;
+            video.currentTime = lineTargetTime;
           } else {
             video.currentTime = Math.max(0, video.currentTime + delta);
           }
@@ -664,6 +773,16 @@
       scrollBoxEl = liveScrollBox;
 
       const rawTime = getAccuratePlaybackTime();
+
+      // If running predictive sync and the true song duration becomes available, refine predicted timestamps
+      if (isPredictedSync && currentLyricsData && currentLyricsData.lyrics) {
+        const liveDur = getExpectedTrackDuration();
+        if (liveDur > 30 && Math.abs(liveDur - lastPredictedDuration) > 2) {
+          lastPredictedDuration = liveDur;
+          parsedLyrics = predictSyncedLyrics(currentLyricsData.lyrics, liveDur);
+          activeIndex = -2;
+        }
+      }
 
       // Clear awaitingVideoReset once the new song stream resets currentTime near 0 (or timeout passes)
       if (awaitingVideoReset) {

@@ -92,6 +92,12 @@ ytmusic-player-page ytmusic-description-shelf-renderer.ytm-lyrics-active-shelf y
   border-color: rgba(76, 217, 100, 0.3);
 }
 
+.lyrics-status-badge.predicted {
+  background: rgba(56, 189, 248, 0.2);
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
 /* 4. Scrollable Container (Natural native scrolling) */
 #ytm-embedded-scroll-box {
   position: relative;
