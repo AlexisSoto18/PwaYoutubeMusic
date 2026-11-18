@@ -106,15 +106,21 @@
     const { full: fullArtist, primary: primaryArtist } = extractArtists(rawArtist);
     const cleanedTitle = cleanTrackTitle(track);
 
-    const searchApi = async (url) => {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        return await res.json();
-      } catch (e) {
-        console.warn('[YTM Sync Lyrics] Search request failed:', e);
-        return null;
-      }
+    const searchApi = (url) => {
+      return new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: 'FETCH_API', url }, (res) => {
+            if (chrome.runtime.lastError || !res || !res.success) {
+              resolve(null);
+            } else {
+              resolve(res.data);
+            }
+          });
+        } catch (e) {
+          console.warn('[YTM Sync Lyrics] Message passing failed:', e);
+          resolve(null);
+        }
+      });
     };
 
     const pickBestLyrics = (results) => {
