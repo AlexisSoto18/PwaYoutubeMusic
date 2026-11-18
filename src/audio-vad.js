@@ -21,6 +21,8 @@
   // --- Acoustic VAD State ---
   let isSignalAvailable = false;
   let nonZeroFramesCount = 0;
+  let consecutiveZeroFrames = 0;
+  let lastStreamTrackCount = 0;
   let rollingNoiseFloor = 18;
   let rollingPeakVocal = 75;
   let smoothedVocalScore = 0;
@@ -37,9 +39,21 @@
   let lastSampleWallTime = 0;
 
   /**
-   * Reset VAD tracking state on track change.
+   * Reset VAD tracking state on track change and force fresh stream re-attachment.
    */
   function resetTrackState() {
+    isSignalAvailable = false;
+    nonZeroFramesCount = 0;
+    consecutiveZeroFrames = 0;
+    lastStreamTrackCount = 0;
+    if (sourceNode) {
+      try {
+        sourceNode.disconnect();
+      } catch (_) {}
+      sourceNode = null;
+    }
+    attachedVideo = null;
+    attachedStream = null;
     rollingNoiseFloor = 18;
     rollingPeakVocal = 75;
     smoothedVocalScore = 0;
@@ -73,23 +87,29 @@
         audioCtx.resume().catch(() => {});
       }
 
-      // Check if already attached to this video with an active audio track
-      if (attachedVideo === video && analyser && attachedStream) {
+      const captureFn = video.captureStream || video.mozCaptureStream;
+      if (typeof captureFn !== 'function') return false;
+
+      const rawStream = captureFn.call(video);
+      if (!rawStream) return false;
+
+      const allAudioTracks = rawStream.getAudioTracks();
+      const liveAudioTracks = allAudioTracks.filter(t => t.readyState === 'live');
+      if (liveAudioTracks.length === 0) {
+        return false;
+      }
+
+      // Check if already attached to this exact track count on this video
+      if (
+        attachedVideo === video &&
+        analyser &&
+        attachedStream &&
+        allAudioTracks.length === lastStreamTrackCount
+      ) {
         const tracks = attachedStream.getAudioTracks();
         if (tracks.length > 0 && tracks[0].readyState === 'live') {
           return true;
         }
-      }
-
-      const captureFn = video.captureStream || video.mozCaptureStream;
-      if (typeof captureFn !== 'function') return false;
-
-      const stream = captureFn.call(video);
-      if (!stream) return false;
-
-      const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-        return false;
       }
 
       if (sourceNode) {
@@ -106,12 +126,18 @@
         timeBuffer = new Uint8Array(analyser.fftSize);
       }
 
-      sourceNode = audioCtx.createMediaStreamSource(stream);
+      // On MSE track transitions Chromium appends new audioTracks to captureStream();
+      // always isolate the newest live audio track into a dedicated MediaStream.
+      const latestTrack = liveAudioTracks[liveAudioTracks.length - 1];
+      const isolatedStream = new MediaStream([latestTrack]);
+
+      sourceNode = audioCtx.createMediaStreamSource(isolatedStream);
       // Connect ONLY to analyser (never to audioCtx.destination) so native audio output is untouched
       sourceNode.connect(analyser);
 
       attachedVideo = video;
-      attachedStream = stream;
+      attachedStream = isolatedStream;
+      lastStreamTrackCount = allAudioTracks.length;
       return true;
     } catch (e) {
       return false;
@@ -185,11 +211,18 @@
     const vocalBandEnergy = vocalWeightSum > 0 ? (vocalSum / vocalWeightSum) : 0;
     const highEnergy = highCount > 0 ? (highSum / highCount) : 0;
 
-    // Verify we are receiving real decoded PCM data (not zeroed by EME/DRM)
+    // Verify we are receiving real decoded PCM data (not zeroed by stale track or DRM)
     if (maxBinVal > 3 || bassEnergy > 3) {
+      consecutiveZeroFrames = 0;
       nonZeroFramesCount++;
       if (nonZeroFramesCount >= 5) {
         isSignalAvailable = true;
+      }
+    } else {
+      consecutiveZeroFrames++;
+      if (consecutiveZeroFrames >= 60) {
+        isSignalAvailable = false;
+        attachedStream = null;
       }
     }
 
