@@ -82,14 +82,30 @@
   }
 
   /**
-   * Fallback: Extract native lyrics directly from YouTube Music's DOM.
+   * Locate the active lyrics description shelf specifically inside ytmusic-player-page
+   * (never match album/artist description shelves on background browse pages).
+   */
+  function getPlayerLyricsShelf() {
+    const shelves = document.querySelectorAll(
+      'ytmusic-player-page ytmusic-tab-renderer ytmusic-description-shelf-renderer, ' +
+      'ytmusic-player-page ytmusic-description-shelf-renderer'
+    );
+    if (!shelves || shelves.length === 0) return null;
+
+    for (const s of shelves) {
+      if (s.offsetParent !== null) return s;
+    }
+    return shelves[0];
+  }
+
+  /**
+   * Fallback: Extract native lyrics directly from YouTube Music's player lyrics DOM.
    */
   function getNativeYTMLyrics() {
-    const el = document.querySelector(
-      'ytmusic-description-shelf-renderer yt-formatted-string.description, ' +
-      'ytmusic-description-shelf-renderer .description, ' +
-      'ytmusic-tab-renderer[page-type*="LYRICS"] .description'
-    );
+    const shelf = getPlayerLyricsShelf();
+    if (!shelf) return null;
+
+    const el = shelf.querySelector('yt-formatted-string.description, .description');
     if (el && el.textContent) {
       const text = el.textContent.trim();
       if (text.length > 20 && !text.toLowerCase().includes('no lyrics available')) {
@@ -196,17 +212,18 @@
   }
 
   /**
-   * Mount or update embedded lyrics container inside YouTube Music's native lyrics shelf.
+   * Mount or update embedded lyrics container inside YouTube Music's native player lyrics shelf.
    */
   function ensureEmbeddedContainer() {
     // Clean up any old floating viewport if still in DOM
     const oldFloating = document.getElementById('lyrics-viewport');
     if (oldFloating) oldFloating.remove();
 
-    const shelf = document.querySelector('ytmusic-description-shelf-renderer');
+    const shelf = getPlayerLyricsShelf();
     if (!shelf) return false;
 
-    // Hide native description string
+    // Mark this specific shelf as active and hide its native description string
+    shelf.classList.add('ytm-lyrics-active-shelf');
     const nativeDesc = shelf.querySelector('.description');
     if (nativeDesc) {
       nativeDesc.style.setProperty('display', 'none', 'important');
@@ -297,8 +314,8 @@
       scrollBoxEl.addEventListener('wheel', handleUserManualScroll, { passive: true });
       scrollBoxEl.addEventListener('touchstart', handleUserManualScroll, { passive: true });
     } else {
-      // If the shelf re-rendered and the container was detached, re-attach it
-      if (!container.isConnected) {
+      // If the container is not inside the current active player shelf, move it here!
+      if (!shelf.contains(container)) {
         if (nativeDesc && nativeDesc.parentNode) {
           nativeDesc.parentNode.insertBefore(container, nativeDesc);
         } else {
@@ -577,8 +594,10 @@
 
     const songKey = `${title}:::${artist}`;
     if (songKey === currentSongKey) {
-      // Re-mount if shelf was re-created in DOM (e.g. user switched tabs)
-      if (document.querySelector('ytmusic-description-shelf-renderer') && !document.getElementById('ytm-embedded-lyrics-container')) {
+      // Re-mount if player shelf was re-created or switched in DOM
+      const shelf = getPlayerLyricsShelf();
+      const container = document.getElementById('ytm-embedded-lyrics-container');
+      if (shelf && (!container || !shelf.contains(container))) {
         renderLyrics(currentLyricsData, currentTitle, currentArtist);
       }
       return;
@@ -666,15 +685,23 @@
 
     // Observe YTM tab content to inject embedded container when LETRA tab is open
     const tabObserver = new MutationObserver(() => {
-      const shelf = document.querySelector('ytmusic-description-shelf-renderer');
-      if (shelf) {
-        const nativeDesc = shelf.querySelector('.description');
-        if (nativeDesc && nativeDesc.style.display !== 'none') {
-          nativeDesc.style.setProperty('display', 'none', 'important');
-        }
+      if (!currentSongKey) {
+        checkTrackChange();
+      }
 
-        if (!document.getElementById('ytm-embedded-lyrics-container') && currentSongKey) {
-          renderLyrics(currentLyricsData, currentTitle, currentArtist);
+      const shelf = getPlayerLyricsShelf();
+      if (shelf) {
+        const container = document.getElementById('ytm-embedded-lyrics-container');
+        if (!container || !shelf.contains(container)) {
+          if (currentSongKey) {
+            if (!currentLyricsData) {
+              const native = getNativeYTMLyrics();
+              if (native) {
+                currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
+              }
+            }
+            renderLyrics(currentLyricsData, currentTitle, currentArtist);
+          }
         }
       }
     });

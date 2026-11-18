@@ -2,8 +2,8 @@
    YTM Sync Lyrics - Native Embedded Theme (Option A)
    ========================================================================== */
 
-/* 1. Hide native static plain-text lyrics from YouTube Music */
-ytmusic-description-shelf-renderer yt-formatted-string.description {
+/* 1. Hide native static plain-text lyrics ONLY on the active player shelf where our container is mounted */
+ytmusic-player-page ytmusic-description-shelf-renderer.ytm-lyrics-active-shelf yt-formatted-string.description {
   display: none !important;
 }
 
