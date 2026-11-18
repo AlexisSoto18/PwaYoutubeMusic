@@ -94,6 +94,7 @@ ytmusic-player-page ytmusic-description-shelf-renderer.ytm-lyrics-active-shelf y
 
 /* 4. Scrollable Container (Natural native scrolling) */
 #ytm-embedded-scroll-box {
+  position: relative;
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;

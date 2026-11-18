@@ -11,9 +11,10 @@
   let currentTitle = '';
   let currentArtist = '';
   let currentLyricsData = null;
+  let currentLRCLIBResults = null;
   let parsedLyrics = [];
   let isSynced = false;
-  let activeIndex = -1;
+  let activeIndex = -2;
   let syncOffset = 0;
   let syncAnimationFrameId = null;
   let userScrollTimer = null;
@@ -21,6 +22,9 @@
   let activeRequestId = 0;
   let lastVideoTime = 0;
   let currentFontSize = 26;
+  let awaitingVideoReset = false;
+  let trackChangeTimestamp = 0;
+  let boundVideoEl = null;
 
   // --- Elements Cache ---
   let embeddedContainerEl = null;
@@ -120,6 +124,82 @@
   }
 
   /**
+   * Parse "mm:ss" or "hh:mm:ss" string into total seconds.
+   */
+  function parseTimeStringToSeconds(timeStr) {
+    if (!timeStr) return 0;
+    const parts = timeStr.trim().split(':').map(n => parseInt(n, 10));
+    if (parts.some(isNaN)) return 0;
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return 0;
+  }
+
+  /**
+   * Get the accurate duration of the current song.
+   * During automatic queue transitions, video.duration briefly holds the previous song's duration,
+   * whereas the selected queue item already has the true duration of the new song.
+   */
+  function getExpectedTrackDuration() {
+    // 1. Check the currently selected queue item (updates immediately on automatic transition)
+    const selectedQueueDurationEl = document.querySelector(
+      'ytmusic-player-queue-item[selected] .duration, ' +
+      'ytmusic-player-queue-item[play-button-state="playing"] .duration'
+    );
+    if (selectedQueueDurationEl && selectedQueueDurationEl.textContent) {
+      const qSec = parseTimeStringToSeconds(selectedQueueDurationEl.textContent);
+      if (qSec > 0) return qSec;
+    }
+
+    // 2. Fallback to video.duration if valid and video is not still at the end of the previous track
+    const video = document.querySelector('video');
+    if (video && !isNaN(video.duration) && video.duration > 0 && !awaitingVideoReset) {
+      return video.duration;
+    }
+
+    return 0;
+  }
+
+  /**
+   * Pick the best synced or plain lyrics from an LRCLIB result list for a given targetDuration.
+   */
+  function pickBestLyricsFromResults(results, targetDuration) {
+    if (!Array.isArray(results) || results.length === 0) return null;
+
+    // 1. Prioritize synced lyrics
+    const withSynced = results.filter(item => item.syncedLyrics && item.syncedLyrics.trim().length > 0);
+    if (withSynced.length > 0) {
+      if (targetDuration && targetDuration > 0) {
+        withSynced.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
+      }
+      return {
+        type: 'synced',
+        lyrics: withSynced[0].syncedLyrics,
+        duration: withSynced[0].duration || 0,
+        id: withSynced[0].id,
+        source: 'lrclib'
+      };
+    }
+
+    // 2. Fallback to plain lyrics
+    const withPlain = results.filter(item => item.plainLyrics && item.plainLyrics.trim().length > 0);
+    if (withPlain.length > 0) {
+      if (targetDuration && targetDuration > 0) {
+        withPlain.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
+      }
+      return {
+        type: 'plain',
+        lyrics: withPlain[0].plainLyrics,
+        duration: withPlain[0].duration || 0,
+        id: withPlain[0].id,
+        source: 'lrclib'
+      };
+    }
+
+    return null;
+  }
+
+  /**
    * Fetch synced or plain lyrics from LRCLIB using smart cascaded queries and duration matching.
    */
   async function fetchLyrics(track, rawArtist, targetDuration) {
@@ -143,30 +223,6 @@
       });
     };
 
-    const pickBestLyrics = (results) => {
-      if (!Array.isArray(results) || results.length === 0) return null;
-
-      // 1. Prioritize synced lyrics
-      const withSynced = results.filter(item => item.syncedLyrics && item.syncedLyrics.trim().length > 0);
-      if (withSynced.length > 0) {
-        if (targetDuration && targetDuration > 0) {
-          withSynced.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
-        }
-        return { type: 'synced', lyrics: withSynced[0].syncedLyrics, source: 'lrclib' };
-      }
-
-      // 2. Fallback to plain lyrics
-      const withPlain = results.filter(item => item.plainLyrics && item.plainLyrics.trim().length > 0);
-      if (withPlain.length > 0) {
-        if (targetDuration && targetDuration > 0) {
-          withPlain.sort((a, b) => Math.abs((a.duration || 0) - targetDuration) - Math.abs((b.duration || 0) - targetDuration));
-        }
-        return { type: 'plain', lyrics: withPlain[0].plainLyrics, source: 'lrclib' };
-      }
-
-      return null;
-    };
-
     // Cascade of query attempts in priority order:
     const queryUrls = [
       // Step 1: Cleaned title + primary artist (vital for songs with collaborations like "Los Principios")
@@ -178,9 +234,7 @@
       // Step 4: Free-text search: cleaned title + primary artist
       `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${primaryArtist}`)}`,
       // Step 5: Free-text search: cleaned title + full artist
-      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${fullArtist}`)}`,
-      // Step 6: Free-text search: cleaned title only
-      `https://lrclib.net/api/search?q=${encodeURIComponent(cleanedTitle)}`
+      `https://lrclib.net/api/search?q=${encodeURIComponent(`${cleanedTitle} ${fullArtist}`)}`
     ];
 
     const seen = new Set();
@@ -189,11 +243,14 @@
       seen.add(url);
 
       const results = await searchApi(url);
-      const match = pickBestLyrics(results);
-      if (match) return match;
+      const match = pickBestLyricsFromResults(results, targetDuration);
+      if (match) {
+        currentLRCLIBResults = results;
+        return match;
+      }
     }
 
-    // Step 7: Native YouTube Music lyrics fallback from DOM
+    // Step 6: Native YouTube Music lyrics fallback from DOM
     const nativeLyrics = getNativeYTMLyrics();
     if (nativeLyrics) {
       return { type: 'plain', lyrics: nativeLyrics, source: 'ytm' };
@@ -440,9 +497,59 @@
     scrollBoxEl.innerHTML = '';
     scrollBoxEl.appendChild(fragment);
     scrollBoxEl.scrollTop = 0;
-    activeIndex = -1;
+
+    // Also reset outer tab-renderer scroll position if user had scrolled the outer tab
+    const outerTabRenderer = document.querySelector('ytmusic-player-page #tab-renderer');
+    if (outerTabRenderer) {
+      outerTabRenderer.scrollTop = 0;
+    }
+
+    // Use -2 sentinel so the very first frame (even when currentIndex is -1 during intro) forces a clean UI sync
+    activeIndex = -2;
 
     startSyncLoop();
+  }
+
+  /**
+   * Bind lifecycle events directly to the HTML5 <video> element to catch automatic track transitions
+   * and update duration matching when the new stream metadata loads.
+   */
+  function bindVideoListeners() {
+    const video = document.querySelector('video');
+    if (!video || video === boundVideoEl) return;
+    boundVideoEl = video;
+
+    const handleStreamReady = () => {
+      awaitingVideoReset = false;
+      isUserScrolling = false;
+      activeIndex = -2;
+
+      if (scrollBoxEl) {
+        scrollBoxEl.scrollTop = 0;
+      }
+
+      // Re-verify track metadata in case player bar updated at the same time
+      checkTrackChange();
+
+      // If LRCLIB returned multiple versions, re-pick using the now-accurate video.duration
+      if (currentLRCLIBResults && !isNaN(video.duration) && video.duration > 0) {
+        const betterMatch = pickBestLyricsFromResults(currentLRCLIBResults, video.duration);
+        if (betterMatch && currentLyricsData && betterMatch.id !== currentLyricsData.id) {
+          renderLyrics(betterMatch, currentTitle, currentArtist);
+        }
+      }
+    };
+
+    video.addEventListener('loadedmetadata', handleStreamReady);
+    video.addEventListener('durationchange', handleStreamReady);
+    video.addEventListener('ended', () => {
+      awaitingVideoReset = true;
+      trackChangeTimestamp = Date.now();
+      activeIndex = -2;
+      if (scrollBoxEl) {
+        scrollBoxEl.scrollTop = 0;
+      }
+    });
   }
 
   /**
@@ -457,6 +564,7 @@
     const video = document.querySelector('video');
     if (!video) return;
 
+    bindVideoListeners();
     lastVideoTime = video.currentTime;
 
     function update() {
@@ -466,14 +574,26 @@
 
       const rawTime = video.currentTime;
 
-      // Song loop/rewind detection: if video jumped back > 2s, reset scroll to top
+      // Clear awaitingVideoReset once the new song stream resets currentTime near 0 (or timeout passes)
+      if (awaitingVideoReset) {
+        if (rawTime < 3 || (Date.now() - trackChangeTimestamp > 3500)) {
+          awaitingVideoReset = false;
+          activeIndex = -2;
+        }
+      }
+
+      // Song loop/rewind detection: if video jumped back > 2s, force sentinel -2 so active classes & scroll reset
       if (rawTime < lastVideoTime - 2) {
-        activeIndex = -1;
-        scrollBoxEl.scrollTo({ top: 0, behavior: 'smooth' });
+        awaitingVideoReset = false;
+        isUserScrolling = false;
+        activeIndex = -2;
       }
       lastVideoTime = rawTime;
 
-      const currentTime = rawTime + syncOffset;
+      // If the player is still holding the end timestamp of the previous song while loading the next track,
+      // treat time as 0 so it never jumps to the bottom of the new lyrics!
+      const effectiveRawTime = (awaitingVideoReset && rawTime > 5) ? 0 : rawTime;
+      const currentTime = effectiveRawTime + syncOffset;
       let currentIndex = -1;
 
       for (let i = 0; i < parsedLyrics.length; i++) {
@@ -606,24 +726,31 @@
     currentTitle = title;
     currentArtist = artist;
     currentLyricsData = null;
+    currentLRCLIBResults = null;
 
     if (syncAnimationFrameId) {
       cancelAnimationFrame(syncAnimationFrameId);
       syncAnimationFrameId = null;
     }
 
+    const video = document.querySelector('video');
+    bindVideoListeners();
+
+    // If video.currentTime is still > 4s when the title changes, <video> hasn't reset to 0s for the new track yet!
+    trackChangeTimestamp = Date.now();
+    awaitingVideoReset = Boolean(video && video.currentTime > 4);
+
     parsedLyrics = [];
     isSynced = false;
-    activeIndex = -1;
+    activeIndex = -2;
     syncOffset = 0;
     isUserScrolling = false;
 
     injectToggleButton();
     renderLoadingState(title, artist);
 
-    // Fetch lyrics with duration matching
-    const video = document.querySelector('video');
-    const targetDuration = video && !isNaN(video.duration) ? video.duration : 0;
+    // Fetch lyrics with accurate duration from selected queue item or video
+    const targetDuration = getExpectedTrackDuration();
     const data = await fetchLyrics(title, artist, targetDuration);
 
     // Stale request guard: if song changed while fetching, discard this result!
