@@ -17,6 +17,7 @@
       "js": [
         "src/phonetics.js",
         "src/player-clock.js",
+        "src/audio-vad.js",
         "src/forced-alignment.js",
         "src/lyrics-provider.js",
         "content.js"

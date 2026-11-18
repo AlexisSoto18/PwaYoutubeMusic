@@ -1,15 +1,20 @@
 /**
- * YTM Sync Lyrics - Forced Alignment Engine (DTW / Viterbi & Vocal Onset Alignment)
+ * YTM Sync Lyrics - Forced Alignment Engine (DTW / Viterbi & Live Acoustic VAD Alignment)
  * Aligns plain text lyrics (YTM PLAIN / PLAIN) to audio timestamps using:
  * 1. Dynamic Time Warping (DTW) & Viterbi monotonic path decoding against CTC/ASR segments.
- * 2. Piecewise phonetic & structural interpolation between acoustic anchors.
- * 3. Dynamic Viterbi forward re-alignment when an onset/line anchor is triggered.
+ * 2. Multi-Anchor Piecewise Phonetic Interpolation with Local Singer Tempo Learning.
+ * 3. Live Acoustic VAD Coupling (Intro Hold, Instrumental/Requinto Freeze, Phrase Onset Snap).
  */
 
 (() => {
   'use strict';
 
   window.YTMLyrics = window.YTMLyrics || {};
+
+  // Natural human singing pace baseline: ~0.27s per phonetic weight unit (~2.4s - 3.2s per verse)
+  const NATURAL_SEC_PER_WEIGHT = 0.27;
+  const MIN_SEC_PER_WEIGHT = 0.13;
+  const MAX_SEC_PER_WEIGHT = 0.58;
 
   /**
    * Build structured phonetic line units from plain text lyrics.
@@ -62,7 +67,7 @@
 
     for (let i = 0; i < units.length; i++) {
       if (units[i].hasStanzaBreakBefore) {
-        units[i].pauseWeightBefore = (i === midBridgeIndex) ? 8.5 : 2.2;
+        units[i].pauseWeightBefore = (i === midBridgeIndex) ? 10.5 : 2.5;
       }
     }
 
@@ -70,18 +75,29 @@
   }
 
   /**
+   * Compute total phonetic + pause weight between two unit indices [startIdx .. endIdx].
+   */
+  function computeSpanWeight(units, startIdx, endIdx, includeEndLineWeight = true) {
+    let totalWeight = 0;
+    const last = includeEndLineWeight ? endIdx : (endIdx - 1);
+    for (let i = startIdx; i <= last; i++) {
+      const pauseW = (i === startIdx) ? 0 : units[i].pauseWeightBefore;
+      totalWeight += pauseW + units[i].lineWeight;
+    }
+    if (!includeEndLineWeight && endIdx > startIdx) {
+      totalWeight += units[endIdx].pauseWeightBefore;
+    }
+    return Math.max(0.5, totalWeight);
+  }
+
+  /**
    * Distribute timestamps across a slice of units [startIdx..endIdx] spanning [startTime..endTime]
    * weighted by each unit's phonetic syllables and stanza pauses.
    */
   function interpolateUnitsSpan(units, startIdx, endIdx, startTime, endTime) {
-    let totalWeight = 0;
-    for (let i = startIdx; i <= endIdx; i++) {
-      const pauseW = (i === startIdx) ? 0 : units[i].pauseWeightBefore;
-      totalWeight += pauseW + units[i].lineWeight;
-    }
-
-    const spanSeconds = Math.max(0.5, endTime - startTime);
-    const scale = spanSeconds / (totalWeight || 1);
+    const totalWeight = computeSpanWeight(units, startIdx, endIdx, true);
+    const spanSeconds = Math.max(0.4, endTime - startTime);
+    const scale = spanSeconds / totalWeight;
     let cursor = startTime;
 
     for (let i = startIdx; i <= endIdx; i++) {
@@ -99,7 +115,6 @@
   function buildASRCandidates(asrSegments) {
     if (!Array.isArray(asrSegments) || asrSegments.length === 0) return [];
 
-    // Collect all timed words if available, otherwise use segment boundaries
     const allWords = [];
     for (const seg of asrSegments) {
       if (Array.isArray(seg.words) && seg.words.length > 0) {
@@ -120,7 +135,6 @@
 
     if (allWords.length === 0) return [];
 
-    // Create sliding windows of words to match lyric lines of varying lengths
     const candidates = [];
     for (const seg of asrSegments) {
       candidates.push({ time: seg.time, text: seg.text });
@@ -139,10 +153,94 @@
   }
 
   /**
-   * Perform Monotonic Forced Alignment (Viterbi / DTW) between known lyric lines
-   * and timed ASR candidates, then interpolate remaining lines via phonetic weights.
+   * Solve piecewise timestamps across all units given any set of locked anchors (unit.anchorTime)
+   * using Local Singer Tempo Learning so tempo changes between anchors propagate forward naturally.
    */
-  function alignLyrics(plainText, durationSeconds, asrSegments = []) {
+  function solvePiecewiseWithLocalTempo(units, dur, introDefault, maxSingingEnd) {
+    const anchoredIndices = [];
+    for (let i = 0; i < units.length; i++) {
+      if (typeof units[i].anchorTime === 'number' && !Number.isNaN(units[i].anchorTime)) {
+        anchoredIndices.push(i);
+      }
+    }
+
+    if (anchoredIndices.length === 0) {
+      interpolateUnitsSpan(units, 0, units.length - 1, introDefault, maxSingingEnd);
+      return;
+    }
+
+    // 1. Before first anchor: back-project using natural or local singing pace
+    const firstAnchorIdx = anchoredIndices[0];
+    const firstAnchorTime = units[firstAnchorIdx].anchorTime;
+
+    if (firstAnchorIdx > 0) {
+      const preWeight = computeSpanWeight(units, 0, firstAnchorIdx, false);
+      const estimatedStart = Math.max(0.8, firstAnchorTime - preWeight * NATURAL_SEC_PER_WEIGHT);
+      interpolateUnitsSpan(units, 0, firstAnchorIdx, estimatedStart, firstAnchorTime);
+    }
+    units[firstAnchorIdx].time = Math.round(firstAnchorTime * 100) / 100;
+
+    // 2. Between consecutive anchors: exact piecewise phonetic interpolation
+    let latestObservedSecPerWeight = NATURAL_SEC_PER_WEIGHT;
+
+    for (let k = 0; k < anchoredIndices.length - 1; k++) {
+      const idxA = anchoredIndices[k];
+      const idxB = anchoredIndices[k + 1];
+      const timeA = units[idxA].anchorTime;
+      const timeB = units[idxB].anchorTime;
+
+      const spanW = computeSpanWeight(units, idxA, idxB, false);
+      const spanDt = Math.max(0.3, timeB - timeA);
+
+      // If the two anchors are reasonably close (<= 14 lines apart, not spanning a huge instrumental solo),
+      // learn the singer's real local tempo (seconds per phonetic weight).
+      if (idxB - idxA <= 14) {
+        const observed = spanDt / spanW;
+        latestObservedSecPerWeight = Math.max(MIN_SEC_PER_WEIGHT, Math.min(MAX_SEC_PER_WEIGHT, observed));
+      }
+
+      if (idxB - idxA === 1) {
+        units[idxB].time = Math.round(timeB * 100) / 100;
+      } else {
+        interpolateUnitsSpan(units, idxA, idxB, timeA, timeB);
+        units[idxA].time = Math.round(timeA * 100) / 100;
+        units[idxB].time = Math.round(timeB * 100) / 100;
+      }
+    }
+
+    // 3. After the last anchor: project forward using learned local singer tempo blended with remaining duration
+    const lastAnchorIdx = anchoredIndices[anchoredIndices.length - 1];
+    if (lastAnchorIdx < units.length - 1) {
+      const lastAnchorTime = units[lastAnchorIdx].anchorTime;
+      const remainingWeight = computeSpanWeight(units, lastAnchorIdx, units.length - 1, true);
+      const globalBudgetEnd = Math.max(lastAnchorTime + (units.length - lastAnchorIdx) * 1.4, maxSingingEnd);
+      const globalSecPerWeight = Math.max(
+        MIN_SEC_PER_WEIGHT,
+        Math.min(MAX_SEC_PER_WEIGHT, (globalBudgetEnd - lastAnchorTime) / remainingWeight)
+      );
+
+      // When 2+ anchors exist, trust the singer's local measured tempo (75% local / 25% global).
+      // When only 1 anchor exists, blend natural vocal tempo (60%) with global track budget (40%)
+      // so long instrumental outros or bridges don't artificially stretch the immediate next verses!
+      const effectiveSecPerWeight = anchoredIndices.length >= 2
+        ? (latestObservedSecPerWeight * 0.75 + globalSecPerWeight * 0.25)
+        : (NATURAL_SEC_PER_WEIGHT * 0.60 + globalSecPerWeight * 0.40);
+
+      const projectedEnd = Math.min(
+        dur - 1.5,
+        Math.max(lastAnchorTime + 1.0, lastAnchorTime + remainingWeight * effectiveSecPerWeight)
+      );
+
+      interpolateUnitsSpan(units, lastAnchorIdx, units.length - 1, lastAnchorTime, projectedEnd);
+      units[lastAnchorIdx].time = Math.round(lastAnchorTime * 100) / 100;
+    }
+  }
+
+  /**
+   * Perform Monotonic Forced Alignment (Viterbi / DTW) between known lyric lines,
+   * timed ASR candidates, and optional saved/user anchors.
+   */
+  function alignLyrics(plainText, durationSeconds, asrSegments = [], customAnchors = null) {
     const { phoneticSimilarity } = window.YTMLyrics.Phonetics;
     const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
     const units = buildPhoneticLineUnits(plainText);
@@ -158,13 +256,11 @@
     let anchorCount = 0;
 
     if (candidates.length > 0) {
-      // Detect vocal onset from first meaningful ASR segment
       const firstVocalTime = candidates[0].time;
       let lastMatchedTime = Math.max(0.5, firstVocalTime - 0.5);
 
       for (let i = 0; i < units.length; i++) {
         const unit = units[i];
-        // Expected time window for line i to prevent matching repeated chorus lines at the wrong end of the song
         const expectedRatio = i / Math.max(1, units.length - 1);
         const expectedTime = introDefault + expectedRatio * (maxSingingEnd - introDefault);
 
@@ -175,7 +271,6 @@
           if (cand.time < lastMatchedTime + 0.35) continue;
           if (cand.time > dur - 2) break;
 
-          // Temporal distance penalty so repeated choruses match their chronological occurrence
           const timeDiff = Math.abs(cand.time - expectedTime);
           if (timeDiff > dur * 0.35) continue;
 
@@ -196,7 +291,6 @@
         }
       }
 
-      // If line 0 didn't match lexically, anchor line 0 to detected vocal onset if reasonable
       if (units[0].anchorTime === null && firstVocalTime >= 1.0 && firstVocalTime <= 28.0) {
         if (units.length < 2 || !units[1].anchorTime || firstVocalTime < units[1].anchorTime) {
           units[0].anchorTime = firstVocalTime;
@@ -205,51 +299,20 @@
       }
     }
 
-    // Piecewise interpolation between locked acoustic anchors
-    const anchoredIndices = [];
-    for (let i = 0; i < units.length; i++) {
-      if (units[i].anchorTime !== null) {
-        anchoredIndices.push(i);
+    // Apply any saved or interactive multi-anchors on top
+    if (customAnchors && typeof customAnchors === 'object') {
+      const entries = Object.entries(customAnchors)
+        .map(([k, v]) => [Number(k), Number(v)])
+        .filter(([idx, t]) => Number.isInteger(idx) && idx >= 0 && idx < units.length && t >= 0)
+        .sort((a, b) => a[0] - b[0]);
+
+      for (const [idx, t] of entries) {
+        units[idx].anchorTime = t;
+        anchorCount++;
       }
     }
 
-    if (anchoredIndices.length === 0) {
-      // Pure Phonetic & Structural Prediction
-      interpolateUnitsSpan(units, 0, units.length - 1, introDefault, maxSingingEnd);
-    } else {
-      // 1. Before first anchor
-      const firstAnchorIdx = anchoredIndices[0];
-      if (firstAnchorIdx > 0) {
-        const startT = Math.min(introDefault, Math.max(1.0, units[firstAnchorIdx].anchorTime * 0.35));
-        interpolateUnitsSpan(units, 0, firstAnchorIdx, startT, units[firstAnchorIdx].anchorTime);
-      }
-      units[firstAnchorIdx].time = Math.round(units[firstAnchorIdx].anchorTime * 100) / 100;
-
-      // 2. Between consecutive anchors
-      for (let k = 0; k < anchoredIndices.length - 1; k++) {
-        const idxA = anchoredIndices[k];
-        const idxB = anchoredIndices[k + 1];
-        const timeA = units[idxA].anchorTime;
-        const timeB = units[idxB].anchorTime;
-
-        if (idxB - idxA === 1) {
-          units[idxB].time = Math.round(timeB * 100) / 100;
-        } else {
-          interpolateUnitsSpan(units, idxA, idxB, timeA, timeB);
-          units[idxA].time = Math.round(timeA * 100) / 100;
-          units[idxB].time = Math.round(timeB * 100) / 100;
-        }
-      }
-
-      // 3. After last anchor
-      const lastAnchorIdx = anchoredIndices[anchoredIndices.length - 1];
-      if (lastAnchorIdx < units.length - 1) {
-        const lastAnchorTime = units[lastAnchorIdx].anchorTime;
-        const endT = Math.max(lastAnchorTime + (units.length - lastAnchorIdx) * 1.8, maxSingingEnd);
-        interpolateUnitsSpan(units, lastAnchorIdx, units.length - 1, lastAnchorTime, endT);
-        units[lastAnchorIdx].time = Math.round(lastAnchorTime * 100) / 100;
-      }
-    }
+    solvePiecewiseWithLocalTempo(units, dur, introDefault, maxSingingEnd);
 
     const lines = units.map(u => ({
       time: u.time,
@@ -267,42 +330,156 @@
   }
 
   /**
-   * Forward & Backward Viterbi Re-Alignment when the user clicks a line to anchor it
-   * at the exact moment the singer sings it.
-   * Instead of a flat offset that drifts later, it locks line[anchorIndex] = currentAudioTime
-   * and rescales all subsequent lines proportionally to fit the remaining track duration!
+   * Multi-Anchor Incremental Viterbi Re-Alignment:
+   * Accumulates user anchors across the song (instead of discarding previous anchors),
+   * enforces monotonic consistency, learns the singer's local tempo between anchors,
+   * and returns the updated lines + sanitized anchors map.
    */
-  function realignFromUserAnchor(plainText, anchorIndex, currentAudioTime, durationSeconds) {
+  function realignFromUserAnchor(plainText, anchorIndex, currentAudioTime, durationSeconds, existingAnchors = {}) {
     const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
     const units = buildPhoneticLineUnits(plainText);
-    if (units.length === 0 || anchorIndex < 0 || anchorIndex >= units.length) return [];
+    if (units.length === 0 || anchorIndex < 0 || anchorIndex >= units.length) {
+      return { lines: [], anchors: existingAnchors || {} };
+    }
 
-    const clampedAnchorTime = Math.max(0.2, currentAudioTime);
+    const clampedAnchorTime = Math.round(Math.max(0.2, currentAudioTime) * 100) / 100;
+    const updatedAnchors = {};
+
+    // Keep previous anchors that remain strictly monotonic with the newly clicked anchor
+    if (existingAnchors && typeof existingAnchors === 'object') {
+      for (const [rawIdx, rawTime] of Object.entries(existingAnchors)) {
+        const idx = Number(rawIdx);
+        const t = Number(rawTime);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= units.length || Number.isNaN(t)) continue;
+        if (idx === anchorIndex) continue;
+        if (idx < anchorIndex && t <= clampedAnchorTime - 0.35) {
+          updatedAnchors[idx] = t;
+        } else if (idx > anchorIndex && t >= clampedAnchorTime + 0.35) {
+          updatedAnchors[idx] = t;
+        }
+      }
+    }
+
+    updatedAnchors[anchorIndex] = clampedAnchorTime;
+
+    for (const [rawIdx, rawTime] of Object.entries(updatedAnchors)) {
+      units[Number(rawIdx)].anchorTime = Number(rawTime);
+    }
+
+    const introDefault = Math.min(15, Math.max(5.5, dur * 0.08));
     const outroDefault = Math.min(14, Math.max(5, dur * 0.075));
-    const endSingingTime = Math.max(clampedAnchorTime + (units.length - anchorIndex) * 1.6, dur - outroDefault);
+    const maxSingingEnd = Math.max(introDefault + 20, dur - outroDefault);
 
-    // 1. Interpolate lines before anchorIndex (if any)
-    if (anchorIndex > 0) {
-      const startTime = Math.min(5.0, clampedAnchorTime * 0.25);
-      interpolateUnitsSpan(units, 0, anchorIndex, startTime, clampedAnchorTime);
-    }
+    solvePiecewiseWithLocalTempo(units, dur, introDefault, maxSingingEnd);
 
-    // 2. Lock the anchor line and redistribute remaining lines [anchorIndex .. N-1]
-    if (anchorIndex < units.length - 1) {
-      interpolateUnitsSpan(units, anchorIndex, units.length - 1, clampedAnchorTime, endSingingTime);
-    }
-    units[anchorIndex].time = Math.round(clampedAnchorTime * 100) / 100;
-
-    return units.map((u, idx) => ({
+    const lines = units.map((u, idx) => ({
       time: u.time,
       text: u.text,
-      isAnchored: idx === anchorIndex
+      isAnchored: Object.prototype.hasOwnProperty.call(updatedAnchors, idx),
+      lineWeight: u.lineWeight,
+      pauseWeightBefore: u.pauseWeightBefore
     }));
+
+    return {
+      lines,
+      anchors: updatedAnchors
+    };
+  }
+
+  /**
+   * Real-time Acoustic VAD coupling for plain/predicted lyrics:
+   * 1. Holds line 0 during long instrumental intros until the first vocal onset is detected.
+   * 2. Freezes advancement to the next lyric line during instrumental bridges/requintos when no voice is active.
+   * 3. Snaps the upcoming line when a vocal phrase onset is detected right after a pause.
+   */
+  function applyLiveVADNudge(parsedLyrics, activeIndex, currentAudioTime, vadState, userAnchors = {}) {
+    if (!vadState || !vadState.isSignalAvailable || !Array.isArray(parsedLyrics) || parsedLyrics.length === 0) {
+      return false;
+    }
+
+    // 1. Intro Vocal Hold: If we haven't detected the first vocal yet and line 0 is not user-anchored,
+    // prevent line 0 from activating during a pure instrumental intro (up to 40s).
+    if (!vadState.hasDetectedFirstVocal && !vadState.isVocalActive && !userAnchors[0]) {
+      if (currentAudioTime < 40 && currentAudioTime >= parsedLyrics[0].time - 0.25) {
+        const pushDelta = (currentAudioTime + 0.45) - parsedLyrics[0].time;
+        if (pushDelta > 0.05) {
+          shiftUnanchoredLinesFrom(parsedLyrics, 0, pushDelta, userAnchors);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // 2. First Vocal Onset Snap: When the singer enters for the first time, snap line 0 if unanchored
+    if (vadState.triggeredPhraseOnset && vadState.firstVocalOnsetTime !== null && activeIndex <= 0 && !userAnchors[0]) {
+      const onsetDelta = vadState.firstVocalOnsetTime - parsedLyrics[0].time;
+      if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 18.0) {
+        shiftUnanchoredLinesFrom(parsedLyrics, 0, onsetDelta, userAnchors);
+        return true;
+      }
+    }
+
+    // 3. Instrumental / Requinto Freeze: If the next line is about to trigger, but the singer has been
+    // silent for >= 0.85s (instrumental bridge, breath gap, or tempo slowdown), hold the next line!
+    const nextIdx = activeIndex + 1;
+    if (nextIdx >= 0 && nextIdx < parsedLyrics.length && !userAnchors[nextIdx]) {
+      const timeUntilNext = parsedLyrics[nextIdx].time - currentAudioTime;
+
+      if (!vadState.isVocalActive && vadState.silenceDurationSec >= 0.85 && timeUntilNext <= 0.22 && timeUntilNext >= -0.6) {
+        const holdDelta = (currentAudioTime + 0.32) - parsedLyrics[nextIdx].time;
+        if (holdDelta > 0.02) {
+          shiftUnanchoredLinesFrom(parsedLyrics, nextIdx, holdDelta, userAnchors);
+          return true;
+        }
+      }
+
+      // 4. Phrase Re-Entry Snap: When the singer's voice returns after a pause/bridge,
+      // if the next line was scheduled slightly ahead (up to +2.8s), snap it to the vocal onset!
+      if (vadState.triggeredPhraseOnset && timeUntilNext > 0.25 && timeUntilNext <= 2.8) {
+        const snapDelta = currentAudioTime - parsedLyrics[nextIdx].time;
+        shiftUnanchoredLinesFrom(parsedLyrics, nextIdx, snapDelta, userAnchors);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Shift unanchored lines starting at `startIndex` by `deltaSec`,
+   * tapering smoothly if there is a locked user anchor further ahead.
+   */
+  function shiftUnanchoredLinesFrom(parsedLyrics, startIndex, deltaSec, userAnchors = {}) {
+    // Find if there is a future locked anchor
+    let nextLockedAnchorIdx = -1;
+    for (let i = startIndex; i < parsedLyrics.length; i++) {
+      if (Object.prototype.hasOwnProperty.call(userAnchors, i)) {
+        nextLockedAnchorIdx = i;
+        break;
+      }
+    }
+
+    if (nextLockedAnchorIdx === -1) {
+      for (let i = startIndex; i < parsedLyrics.length; i++) {
+        const minPrev = i > 0 ? (parsedLyrics[i - 1].time + 0.35) : 0.2;
+        parsedLyrics[i].time = Math.round(Math.max(minPrev, parsedLyrics[i].time + deltaSec) * 100) / 100;
+      }
+    } else if (nextLockedAnchorIdx > startIndex) {
+      const span = nextLockedAnchorIdx - startIndex;
+      for (let i = startIndex; i < nextLockedAnchorIdx; i++) {
+        const factor = 1 - ((i - startIndex) / span);
+        const minPrev = i > 0 ? (parsedLyrics[i - 1].time + 0.3) : 0.2;
+        const maxNext = parsedLyrics[nextLockedAnchorIdx].time - (nextLockedAnchorIdx - i) * 0.3;
+        const shifted = parsedLyrics[i].time + deltaSec * factor;
+        parsedLyrics[i].time = Math.round(Math.min(maxNext, Math.max(minPrev, shifted)) * 100) / 100;
+      }
+    }
   }
 
   window.YTMLyrics.ForcedAlignment = {
     buildPhoneticLineUnits,
     alignLyrics,
-    realignFromUserAnchor
+    realignFromUserAnchor,
+    applyLiveVADNudge
   };
 })();

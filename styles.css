@@ -159,6 +159,11 @@ ytmusic-player-page ytmusic-description-shelf-renderer.ytm-lyrics-active-shelf y
   color: #ffffff;
 }
 
+.lyric-line.is-anchored {
+  border-left: 3px solid rgba(168, 85, 247, 0.75);
+  padding-left: 10px;
+}
+
 .lyric-line:hover {
   color: rgba(255, 255, 255, 0.85);
 }

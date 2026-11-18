@@ -26,8 +26,14 @@
 
   const {
     alignLyrics,
-    realignFromUserAnchor
+    realignFromUserAnchor,
+    applyLiveVADNudge
   } = window.YTMLyrics.ForcedAlignment;
+
+  const {
+    resetTrackState: resetVADState,
+    sampleFrame: sampleVADFrame
+  } = window.YTMLyrics.AudioVAD;
 
   // --- Controller State ---
   let currentSongKey = '';
@@ -36,6 +42,8 @@
   let currentLyricsData = null;
   let currentLRCLIBResults = null;
   let currentASRSegments = [];
+  let currentUserAnchors = {};
+  let savedAnchorsBySong = {};
   let parsedLyrics = [];
   let isSynced = false;
   let isPredictedSync = false;
@@ -87,15 +95,45 @@
     // If current track is using plain lyrics (AUTO-SYNC), upgrade immediately to DTW/Viterbi FORCED-ALIGN!
     if (isPredictedSync && currentLyricsData && currentLyricsData.type === 'plain' && currentASRSegments.length > 0) {
       const targetDur = getExpectedTrackDuration(awaitingVideoReset) || detail.duration || 180;
-      const aligned = alignLyrics(currentLyricsData.lyrics, targetDur, currentASRSegments);
+      const aligned = alignLyrics(currentLyricsData.lyrics, targetDur, currentASRSegments, currentUserAnchors);
       if (aligned.lines.length > 0) {
         parsedLyrics = aligned.lines;
-        alignmentModeLabel = aligned.mode;
+        const userAnchorCount = Object.keys(currentUserAnchors).length;
+        alignmentModeLabel = userAnchorCount > 0 ? `ANCHORED (${userAnchorCount})` : aligned.mode;
         activeIndex = -2;
         updateBadgeDisplay();
+        refreshAnchorMarkers();
       }
     }
   });
+
+  /**
+   * Persist user multi-anchors for the current track in chrome.storage.local.
+   */
+  function saveCurrentTrackAnchors() {
+    if (!currentSongKey) return;
+    if (Object.keys(currentUserAnchors).length > 0) {
+      savedAnchorsBySong[currentSongKey] = { ...currentUserAnchors };
+    } else {
+      delete savedAnchorsBySong[currentSongKey];
+    }
+    chrome.storage.local.set({ ytmSavedAnchors: savedAnchorsBySong });
+  }
+
+  /**
+   * Toggle `.is-anchored` visual marker on lyric lines that have a locked anchor.
+   */
+  function refreshAnchorMarkers() {
+    if (!scrollBoxEl) return;
+    const domLines = scrollBoxEl.getElementsByClassName('lyric-line');
+    for (let i = 0; i < domLines.length; i++) {
+      if (Object.prototype.hasOwnProperty.call(currentUserAnchors, i)) {
+        domLines[i].classList.add('is-anchored');
+      } else {
+        domLines[i].classList.remove('is-anchored');
+      }
+    }
+  }
 
   /**
    * Update status badge label & style according to active mode and offset.
@@ -103,18 +141,22 @@
   function updateBadgeDisplay() {
     if (!statusBadgeEl || !isSynced) return;
 
+    const isForcedOrAnchored = alignmentModeLabel === 'FORCED-ALIGN'
+      || alignmentModeLabel === 'LIVE VAD'
+      || alignmentModeLabel.startsWith('ANCHORED');
+
     statusBadgeEl.className = 'lyrics-status-badge ' + (
-      !isPredictedSync ? 'synced' : (alignmentModeLabel === 'FORCED-ALIGN' ? 'forced' : 'predicted')
+      !isPredictedSync ? 'synced' : (isForcedOrAnchored ? 'forced' : 'predicted')
     );
 
     if (syncOffset === 0) {
       statusBadgeEl.textContent = isPredictedSync ? alignmentModeLabel : 'SYNCED';
       statusBadgeEl.title = isPredictedSync
-        ? 'Click any lyric line when sung to anchor Forced Alignment to that exact second.'
+        ? 'Click lyric lines when sung to add multi-anchors & learn tempo. Click this badge to clear saved anchors.'
         : '';
     } else {
       const sign = syncOffset > 0 ? '+' : '';
-      const shortPrefix = !isPredictedSync ? 'SYNC' : (alignmentModeLabel === 'FORCED-ALIGN' ? 'ALIGN' : 'AUTO');
+      const shortPrefix = !isPredictedSync ? 'SYNC' : (isForcedOrAnchored ? 'ALIGN' : 'AUTO');
       statusBadgeEl.textContent = `${shortPrefix} (${sign}${syncOffset.toFixed(1)}s)`;
       statusBadgeEl.title = 'Click to reset offset to 0s';
     }
@@ -197,6 +239,18 @@
           syncOffset = 0;
           activeIndex = -2;
           updateBadgeDisplay();
+          return;
+        }
+        if (isPredictedSync && Object.keys(currentUserAnchors).length > 0 && currentLyricsData) {
+          currentUserAnchors = {};
+          saveCurrentTrackAnchors();
+          const dur = getExpectedTrackDuration(false) || lastPredictedDuration || 180;
+          const aligned = alignLyrics(currentLyricsData.lyrics, dur, currentASRSegments, {});
+          parsedLyrics = aligned.lines;
+          alignmentModeLabel = aligned.mode;
+          activeIndex = -2;
+          updateBadgeDisplay();
+          refreshAnchorMarkers();
         }
       });
 
@@ -289,9 +343,10 @@
       const targetDur = getExpectedTrackDuration(awaitingVideoReset) || data.duration || 180;
       lastPredictedDuration = targetDur;
 
-      const aligned = alignLyrics(data.lyrics, targetDur, currentASRSegments);
+      const aligned = alignLyrics(data.lyrics, targetDur, currentASRSegments, currentUserAnchors);
       parsedLyrics = aligned.lines;
-      alignmentModeLabel = aligned.mode;
+      const userAnchorCount = Object.keys(currentUserAnchors).length;
+      alignmentModeLabel = userAnchorCount > 0 ? `ANCHORED (${userAnchorCount})` : aligned.mode;
       scrollBoxEl.classList.remove('plain-mode');
       updateBadgeDisplay();
     } else {
@@ -317,26 +372,36 @@
     const fragment = document.createDocumentFragment();
     parsedLyrics.forEach((line, index) => {
       const p = document.createElement('p');
-      p.className = 'lyric-line';
+      p.className = 'lyric-line' + (Object.prototype.hasOwnProperty.call(currentUserAnchors, index) ? ' is-anchored' : '');
       p.dataset.index = index;
       p.textContent = line.text;
       if (isPredictedSync) {
-        p.title = 'Click when sung to anchor Forced Alignment here (or Alt+Click to seek audio)';
+        p.title = 'Click when sung to add multi-anchor & adapt tempo here (or Alt+Click to seek audio)';
       }
 
       p.addEventListener('click', (e) => {
         if (isPredictedSync && !e.altKey) {
-          // Viterbi Piecewise Forward Re-Alignment from this exact line and current playback second!
+          // Multi-Anchor Incremental Viterbi Re-Alignment with Local Tempo Learning
           const currentAccurate = getAccuratePlaybackTime();
           const dur = getExpectedTrackDuration(false) || lastPredictedDuration || 180;
-          const realigned = realignFromUserAnchor(currentLyricsData.lyrics, index, currentAccurate, dur);
-          if (realigned.length > 0) {
-            parsedLyrics = realigned;
+          const result = realignFromUserAnchor(
+            currentLyricsData.lyrics,
+            index,
+            currentAccurate,
+            dur,
+            currentUserAnchors
+          );
+          if (result.lines.length > 0) {
+            parsedLyrics = result.lines;
+            currentUserAnchors = result.anchors;
+            saveCurrentTrackAnchors();
             syncOffset = 0;
-            alignmentModeLabel = 'FORCED-ALIGN';
+            const anchorCount = Object.keys(currentUserAnchors).length;
+            alignmentModeLabel = `ANCHORED (${anchorCount})`;
             isUserScrolling = false;
             activeIndex = -2;
             updateBadgeDisplay();
+            refreshAnchorMarkers();
           }
           return;
         }
@@ -442,11 +507,13 @@
         const liveDur = getExpectedTrackDuration(awaitingVideoReset);
         if (liveDur > 30 && Math.abs(liveDur - lastPredictedDuration) > 2) {
           lastPredictedDuration = liveDur;
-          const aligned = alignLyrics(currentLyricsData.lyrics, liveDur, currentASRSegments);
+          const aligned = alignLyrics(currentLyricsData.lyrics, liveDur, currentASRSegments, currentUserAnchors);
           parsedLyrics = aligned.lines;
-          alignmentModeLabel = aligned.mode;
+          const userAnchorCount = Object.keys(currentUserAnchors).length;
+          alignmentModeLabel = userAnchorCount > 0 ? `ANCHORED (${userAnchorCount})` : aligned.mode;
           activeIndex = -2;
           updateBadgeDisplay();
+          refreshAnchorMarkers();
         }
       }
 
@@ -465,6 +532,19 @@
       lastVideoTime = rawTime;
 
       const effectiveRawTime = (awaitingVideoReset && rawTime > 5) ? 0 : rawTime;
+
+      // Sample Real-Time Acoustic Vocal Activity Detector (VAD) on predicted/plain lyrics
+      if (isPredictedSync && !awaitingVideoReset) {
+        const vadState = sampleVADFrame(getActiveVideo(), effectiveRawTime);
+        if (vadState && vadState.isSignalAvailable) {
+          applyLiveVADNudge(parsedLyrics, activeIndex, effectiveRawTime, vadState, currentUserAnchors);
+          if (alignmentModeLabel === 'AUTO-SYNC') {
+            alignmentModeLabel = 'LIVE VAD';
+            updateBadgeDisplay();
+          }
+        }
+      }
+
       const currentTime = effectiveRawTime + syncOffset;
       let currentIndex = -1;
 
@@ -594,6 +674,8 @@
     currentLyricsData = null;
     currentLRCLIBResults = null;
     currentASRSegments = [];
+    currentUserAnchors = savedAnchorsBySong[songKey] ? { ...savedAnchorsBySong[songKey] } : {};
+    resetVADState();
 
     if (syncAnimationFrameId) {
       cancelAnimationFrame(syncAnimationFrameId);
@@ -629,9 +711,15 @@
   function initObserver() {
     injectPageBridge();
 
-    chrome.storage.local.get(['lyricsFontSize'], (result) => {
+    chrome.storage.local.get(['lyricsFontSize', 'ytmSavedAnchors'], (result) => {
       if (typeof result.lyricsFontSize === 'number') {
         setFontSize(result.lyricsFontSize, false);
+      }
+      if (result.ytmSavedAnchors && typeof result.ytmSavedAnchors === 'object') {
+        savedAnchorsBySong = result.ytmSavedAnchors;
+        if (currentSongKey && savedAnchorsBySong[currentSongKey]) {
+          currentUserAnchors = { ...savedAnchorsBySong[currentSongKey] };
+        }
       }
     });
 
