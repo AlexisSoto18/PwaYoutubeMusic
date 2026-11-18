@@ -211,13 +211,16 @@
     const fluxBoost = Math.min(1.25, 0.8 + (vocalFlux * 0.08));
     const rawVocalSignal = Math.max(0, (vocalBandEnergy - accompanimentPenalty) * (0.7 + 0.45 * Math.min(1, harmonicCoverage * 2.0)) * fluxBoost);
 
-    // Update adaptive rolling floor and peak (allow higher floor for loud mastered tracks)
-    if (rawVocalSignal < rollingNoiseFloor + 8) {
-      rollingNoiseFloor = rollingNoiseFloor * 0.94 + rawVocalSignal * 0.06;
+    // Update adaptive rolling floor WITHOUT chasing active vocal peaks (prevents adaptation poisoning)
+    if (rawVocalSignal < rollingNoiseFloor) {
+      rollingNoiseFloor = rollingNoiseFloor * 0.90 + rawVocalSignal * 0.10;
+    } else if (rawVocalSignal < rollingNoiseFloor + 10) {
+      rollingNoiseFloor = rollingNoiseFloor * 0.985 + rawVocalSignal * 0.015;
     } else {
-      rollingNoiseFloor = rollingNoiseFloor * 0.992 + rawVocalSignal * 0.008;
+      // Gently relax floor downward during sustained singing so the voice isn't swallowed
+      rollingNoiseFloor = rollingNoiseFloor * 0.999 + 25 * 0.001;
     }
-    rollingNoiseFloor = Math.max(12, Math.min(130, rollingNoiseFloor));
+    rollingNoiseFloor = Math.max(12, Math.min(95, rollingNoiseFloor));
 
     if (rawVocalSignal > rollingPeakVocal) {
       rollingPeakVocal = rollingPeakVocal * 0.90 + rawVocalSignal * 0.10;
