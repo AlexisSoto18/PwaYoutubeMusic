@@ -228,9 +228,9 @@
         <div id="ytm-embedded-scroll-box"></div>
       `;
 
-      // Insert right before native description or at the beginning of shelf
-      if (nativeDesc) {
-        shelf.insertBefore(container, nativeDesc);
+      // Insert right before native description using its direct parent or prepend to shelf
+      if (nativeDesc && nativeDesc.parentNode) {
+        nativeDesc.parentNode.insertBefore(container, nativeDesc);
       } else {
         shelf.prepend(container);
       }
@@ -291,6 +291,14 @@
       scrollBoxEl.addEventListener('wheel', handleUserManualScroll, { passive: true });
       scrollBoxEl.addEventListener('touchstart', handleUserManualScroll, { passive: true });
     } else {
+      // If the shelf re-rendered and the container was detached, re-attach it
+      if (!container.isConnected) {
+        if (nativeDesc && nativeDesc.parentNode) {
+          nativeDesc.parentNode.insertBefore(container, nativeDesc);
+        } else {
+          shelf.prepend(container);
+        }
+      }
       embeddedContainerEl = container;
       scrollBoxEl = container.querySelector('#ytm-embedded-scroll-box');
       trackTitleEl = container.querySelector('.ytm-embedded-title');
