@@ -105,11 +105,15 @@
     const shelf = getPlayerLyricsShelf();
     if (!shelf) return null;
 
-    const el = shelf.querySelector('yt-formatted-string.description, .description');
-    if (el && el.textContent) {
-      const text = el.textContent.trim();
-      if (text.length > 20 && !text.toLowerCase().includes('no lyrics available')) {
-        return text;
+    const descriptions = shelf.querySelectorAll(
+      'yt-formatted-string.non-expandable.description, yt-formatted-string.description, .description'
+    );
+    for (const el of descriptions) {
+      if (el && el.textContent) {
+        const text = el.textContent.trim();
+        if (text.length > 20 && !text.toLowerCase().includes('no lyrics available')) {
+          return text;
+        }
       }
     }
     return null;
@@ -222,12 +226,11 @@
     const shelf = getPlayerLyricsShelf();
     if (!shelf) return false;
 
-    // Mark this specific shelf as active and hide its native description string
+    // Mark this specific shelf as active and hide all native description elements
     shelf.classList.add('ytm-lyrics-active-shelf');
-    const nativeDesc = shelf.querySelector('.description');
-    if (nativeDesc) {
-      nativeDesc.style.setProperty('display', 'none', 'important');
-    }
+    shelf.querySelectorAll('.description').forEach((el) => {
+      el.style.setProperty('display', 'none', 'important');
+    });
 
     let container = document.getElementById('ytm-embedded-lyrics-container');
     if (!container) {
@@ -251,12 +254,8 @@
         <div id="ytm-embedded-scroll-box"></div>
       `;
 
-      // Insert right before native description using its direct parent or prepend to shelf
-      if (nativeDesc && nativeDesc.parentNode) {
-        nativeDesc.parentNode.insertBefore(container, nativeDesc);
-      } else {
-        shelf.prepend(container);
-      }
+      // Always prepend directly as a top-level child of shelf (never inside a hidden expandable-description wrapper)
+      shelf.prepend(container);
 
       embeddedContainerEl = container;
       scrollBoxEl = container.querySelector('#ytm-embedded-scroll-box');
@@ -314,13 +313,9 @@
       scrollBoxEl.addEventListener('wheel', handleUserManualScroll, { passive: true });
       scrollBoxEl.addEventListener('touchstart', handleUserManualScroll, { passive: true });
     } else {
-      // If the container is not inside the current active player shelf, move it here!
-      if (!shelf.contains(container)) {
-        if (nativeDesc && nativeDesc.parentNode) {
-          nativeDesc.parentNode.insertBefore(container, nativeDesc);
-        } else {
-          shelf.prepend(container);
-        }
+      // Ensure container is a direct child of the current active player shelf
+      if (container.parentNode !== shelf) {
+        shelf.prepend(container);
       }
       embeddedContainerEl = container;
       scrollBoxEl = container.querySelector('#ytm-embedded-scroll-box');
@@ -597,7 +592,7 @@
       // Re-mount if player shelf was re-created or switched in DOM
       const shelf = getPlayerLyricsShelf();
       const container = document.getElementById('ytm-embedded-lyrics-container');
-      if (shelf && (!container || !shelf.contains(container))) {
+      if (shelf && (!container || container.parentNode !== shelf)) {
         renderLyrics(currentLyricsData, currentTitle, currentArtist);
       }
       return;
@@ -692,7 +687,7 @@
       const shelf = getPlayerLyricsShelf();
       if (shelf) {
         const container = document.getElementById('ytm-embedded-lyrics-container');
-        if (!container || !shelf.contains(container)) {
+        if (!container || container.parentNode !== shelf) {
           if (currentSongKey) {
             if (!currentLyricsData) {
               const native = getNativeYTMLyrics();
@@ -700,6 +695,12 @@
                 currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
               }
             }
+            renderLyrics(currentLyricsData, currentTitle, currentArtist);
+          }
+        } else if (!currentLyricsData && statusBadgeEl && statusBadgeEl.textContent === 'NO LYRICS') {
+          const native = getNativeYTMLyrics();
+          if (native) {
+            currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
             renderLyrics(currentLyricsData, currentTitle, currentArtist);
           }
         }
