@@ -22,7 +22,8 @@
   let isSignalAvailable = false;
   let nonZeroFramesCount = 0;
   let consecutiveZeroFrames = 0;
-  let lastStreamTrackCount = 0;
+  let attachedSrc = '';
+  let lastAttachAttemptMs = 0;
   let rollingNoiseFloor = 18;
   let rollingPeakVocal = 75;
   let smoothedVocalScore = 0;
@@ -45,7 +46,8 @@
     isSignalAvailable = false;
     nonZeroFramesCount = 0;
     consecutiveZeroFrames = 0;
-    lastStreamTrackCount = 0;
+    attachedSrc = '';
+    lastAttachAttemptMs = 0;
     if (sourceNode) {
       try {
         sourceNode.disconnect();
@@ -87,29 +89,31 @@
         audioCtx.resume().catch(() => {});
       }
 
+      const currentSrc = video.currentSrc || video.src || '';
+      const hasLiveTrack = Boolean(attachedStream) &&
+        attachedStream.getAudioTracks().some(t => t.readyState === 'live');
+
+      // Fast path: same <video>, same MSE blob source, track still live -> reuse (no captureStream call)
+      if (attachedVideo === video && analyser && hasLiveTrack && currentSrc === attachedSrc) {
+        return true;
+      }
+
+      // Rate-limit re-attach attempts (captureStream() creates new tracks on every call)
+      const nowMs = performance.now();
+      if (nowMs - lastAttachAttemptMs < 1000) {
+        return hasLiveTrack;
+      }
+      lastAttachAttemptMs = nowMs;
+
       const captureFn = video.captureStream || video.mozCaptureStream;
       if (typeof captureFn !== 'function') return false;
 
       const rawStream = captureFn.call(video);
       if (!rawStream) return false;
 
-      const allAudioTracks = rawStream.getAudioTracks();
-      const liveAudioTracks = allAudioTracks.filter(t => t.readyState === 'live');
+      const liveAudioTracks = rawStream.getAudioTracks().filter(t => t.readyState === 'live');
       if (liveAudioTracks.length === 0) {
         return false;
-      }
-
-      // Check if already attached to this exact track count on this video
-      if (
-        attachedVideo === video &&
-        analyser &&
-        attachedStream &&
-        allAudioTracks.length === lastStreamTrackCount
-      ) {
-        const tracks = attachedStream.getAudioTracks();
-        if (tracks.length > 0 && tracks[0].readyState === 'live') {
-          return true;
-        }
       }
 
       if (sourceNode) {
@@ -126,8 +130,7 @@
         timeBuffer = new Uint8Array(analyser.fftSize);
       }
 
-      // On MSE track transitions Chromium appends new audioTracks to captureStream();
-      // always isolate the newest live audio track into a dedicated MediaStream.
+      // Isolate the newest live audio track (the one bound to the current MSE source)
       const latestTrack = liveAudioTracks[liveAudioTracks.length - 1];
       const isolatedStream = new MediaStream([latestTrack]);
 
@@ -137,7 +140,7 @@
 
       attachedVideo = video;
       attachedStream = isolatedStream;
-      lastStreamTrackCount = allAudioTracks.length;
+      attachedSrc = currentSrc;
       return true;
     } catch (e) {
       return false;
@@ -211,19 +214,22 @@
     const vocalBandEnergy = vocalWeightSum > 0 ? (vocalSum / vocalWeightSum) : 0;
     const highEnergy = highCount > 0 ? (highSum / highCount) : 0;
 
-    // Verify we are receiving real decoded PCM data (not zeroed by stale track or DRM)
-    if (maxBinVal > 3 || bassEnergy > 3) {
-      consecutiveZeroFrames = 0;
-      nonZeroFramesCount++;
-      if (nonZeroFramesCount >= 5) {
-        isSignalAvailable = true;
-      }
-    } else {
+    // Digital silence (all-zero FFT) means the tap is stale/disconnected, NOT that the singer is silent.
+    // Never feed it into the VAD, otherwise Intro Hold / Bridge Freeze push lyrics forward incorrectly.
+    if (!(maxBinVal > 3 || bassEnergy > 3)) {
       consecutiveZeroFrames++;
-      if (consecutiveZeroFrames >= 60) {
+      if (consecutiveZeroFrames >= 45) {
         isSignalAvailable = false;
-        attachedStream = null;
+        nonZeroFramesCount = 0;
+        attachedStream = null; // force a (rate-limited) re-attach
       }
+      return { ...getState(currentAudioTime), isSignalAvailable: false };
+    }
+
+    consecutiveZeroFrames = 0;
+    nonZeroFramesCount++;
+    if (nonZeroFramesCount >= 5) {
+      isSignalAvailable = true;
     }
 
     if (!isSignalAvailable) {
