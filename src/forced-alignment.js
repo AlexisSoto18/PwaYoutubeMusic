@@ -398,9 +398,9 @@
     }
 
     // 1. Intro Vocal Hold: If we haven't detected the first vocal yet and line 0 is not user-anchored,
-    // prevent line 0 from activating during a pure instrumental intro (up to 40s).
+    // prevent line 0 from activating during a pure instrumental intro (up to 50s).
     if (!vadState.hasDetectedFirstVocal && !vadState.isVocalActive && !userAnchors[0]) {
-      if (currentAudioTime < 40 && currentAudioTime >= parsedLyrics[0].time - 0.25) {
+      if (currentAudioTime < 50 && currentAudioTime >= parsedLyrics[0].time - 0.25) {
         const pushDelta = (currentAudioTime + 0.45) - parsedLyrics[0].time;
         if (pushDelta > 0.05) {
           shiftUnanchoredLinesFrom(parsedLyrics, 0, pushDelta, userAnchors);
@@ -412,11 +412,9 @@
 
     // 2. First Vocal Onset Snap: When the singer enters for the first time,
     // anchor line 0 cleanly and taper the adjustment instead of shifting the entire song rigidly.
-    if (vadState.triggeredPhraseOnset && vadState.firstVocalOnsetTime !== null && activeIndex <= 0 && !userAnchors[0]) {
+    if (vadState.triggeredPhraseOnset && vadState.firstVocalOnsetTime !== null && activeIndex <= 2 && !userAnchors[0]) {
       const onsetDelta = vadState.firstVocalOnsetTime - parsedLyrics[0].time;
-      if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 18.0) {
-        // Taper the shift over the first stanza (up to 6 lines) so an early producer tag
-        // or late intro doesn't drag the entire rest of the song out of alignment.
+      if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 22.0) {
         const taperCount = Math.min(parsedLyrics.length, 6);
         for (let i = 0; i < taperCount; i++) {
           if (Object.prototype.hasOwnProperty.call(userAnchors, i)) break;
@@ -432,14 +430,14 @@
       }
     }
 
-    // 3. Instrumental / Requinto Freeze: If the next line is about to trigger, but the singer has been
-    // silent for >= 0.85s (instrumental bridge, breath gap, or tempo slowdown), hold the next line!
+    // 3. Instrumental / Requinto Freeze: Only freeze advancement when the singer has been silent
+    // for >= 1.8s (a true instrumental solo/bridge, NOT a normal ~1s breath between verses).
     const nextIdx = activeIndex + 1;
     if (nextIdx >= 0 && nextIdx < parsedLyrics.length && !userAnchors[nextIdx]) {
       const timeUntilNext = parsedLyrics[nextIdx].time - currentAudioTime;
 
-      if (!vadState.isVocalActive && vadState.silenceDurationSec >= 0.85 && timeUntilNext <= 0.22 && timeUntilNext >= -0.6) {
-        const holdDelta = (currentAudioTime + 0.32) - parsedLyrics[nextIdx].time;
+      if (!vadState.isVocalActive && vadState.silenceDurationSec >= 1.8 && timeUntilNext <= 0.22 && timeUntilNext >= -0.6) {
+        const holdDelta = (currentAudioTime + 0.30) - parsedLyrics[nextIdx].time;
         if (holdDelta > 0.02) {
           shiftUnanchoredLinesFrom(parsedLyrics, nextIdx, holdDelta, userAnchors);
           return true;

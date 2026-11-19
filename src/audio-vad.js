@@ -11,7 +11,7 @@
   window.YTMLyrics = window.YTMLyrics || {};
 
   const TARGET_SAMPLE_RATE = 16000;
-  const BATCH_SAMPLES_16K = 1536; // 3 x 512-sample Silero v5 frames (~96ms per IPC batch)
+  const BATCH_SAMPLES_16K = 1024; // 2 x 512-sample Silero v5 frames (~64ms low-latency batch)
 
   let audioCtx = null;
   let sourceNode = null;
@@ -123,14 +123,14 @@
     sileroProb = maxProb;
     sileroAvgProb = avgProb;
 
-    // Fast attack, smooth release on neural voice probability
-    const effectiveProb = maxProb * 0.65 + avgProb * 0.35;
-    const alpha = effectiveProb > smoothedProb ? 0.55 : 0.30;
+    // Low-latency attack, smooth release on neural voice probability
+    const effectiveProb = maxProb * 0.80 + avgProb * 0.20;
+    const alpha = effectiveProb > smoothedProb ? 0.72 : 0.32;
     smoothedProb = smoothedProb * (1 - alpha) + effectiveProb * alpha;
 
-    // Silero VAD v5 thresholds: instruments/requintos stay < 0.22, human voice > 0.52
-    const onsetThreshold = 0.52;
-    const sustainThreshold = 0.32;
+    // Silero VAD v5 thresholds tuned for singing over music (instruments stay < 0.20)
+    const onsetThreshold = 0.38;
+    const sustainThreshold = 0.24;
     const frameHasVoice = isVocalActive
       ? (smoothedProb >= sustainThreshold)
       : (smoothedProb >= onsetThreshold);
@@ -139,18 +139,18 @@
       currentVocalStreakMs += dtMs;
       currentSilenceStreakMs = 0;
 
-      if (!isVocalActive && currentVocalStreakMs >= 120) {
+      if (!isVocalActive && currentVocalStreakMs >= 64) {
         const prevSilenceSec = batchAudioTime - lastVocalActiveAudioTime;
         isVocalActive = true;
 
         if (!hasDetectedFirstVocal && batchAudioTime >= 0.8) {
           hasDetectedFirstVocal = true;
-          firstVocalOnsetTime = Math.max(0.4, batchAudioTime - 0.14);
+          firstVocalOnsetTime = Math.max(0.4, batchAudioTime - 0.22);
           pendingPhraseOnset = true;
           lastPhraseOnsetAudioTime = firstVocalOnsetTime;
         } else if (prevSilenceSec >= 0.45 && (batchAudioTime - lastPhraseOnsetAudioTime) >= 1.1) {
           pendingPhraseOnset = true;
-          lastPhraseOnsetAudioTime = Math.max(0.4, batchAudioTime - 0.10);
+          lastPhraseOnsetAudioTime = Math.max(0.4, batchAudioTime - 0.18);
         }
       }
 
