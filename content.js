@@ -179,7 +179,27 @@
       if (!Object.prototype.hasOwnProperty.call(currentUserAnchors, match.matchedIndex)) {
         currentWhisperAnchors[match.matchedIndex] = match.matchedTime;
       }
-      parsedLyrics = match.lines;
+
+      // Smoothly blend upcoming timestamps so retroactive Whisper anchors never yank the UI abruptly
+      if (parsedLyrics.length === match.lines.length && activeIndex >= 0) {
+        const blended = match.lines.map((newLine, idx) => {
+          if (idx <= activeIndex || Object.prototype.hasOwnProperty.call(currentUserAnchors, idx)) {
+            return newLine;
+          }
+          const prevTime = parsedLyrics[idx]?.time;
+          if (typeof prevTime === 'number' && Math.abs(newLine.time - prevTime) <= 4.0) {
+            return {
+              ...newLine,
+              time: Math.round((newLine.time * 0.72 + prevTime * 0.28) * 100) / 100
+            };
+          }
+          return newLine;
+        });
+        parsedLyrics = blended;
+      } else {
+        parsedLyrics = match.lines;
+      }
+
       lastWhisperMatch = {
         transcript: detail.text,
         matchedIndex: match.matchedIndex,
@@ -698,6 +718,13 @@
         } else {
           break;
         }
+      }
+
+      // Monotonic UI hysteresis during live Whisper/VAD sync:
+      // never yank the highlight backwards by 1-2 lines when a retroactive Whisper window arrives
+      // (actual user seeks backwards reset activeIndex = -2 above).
+      if (isPredictedSync && activeIndex >= 0 && currentIndex >= 0 && currentIndex < activeIndex) {
+        currentIndex = activeIndex;
       }
 
       if (currentIndex !== activeIndex) {

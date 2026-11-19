@@ -11,7 +11,8 @@ const MODEL_ID = 'onnx-community/whisper-tiny';
 
 // Common Whisper hallucinations on noisy music segments to filter out
 const HALLUCINATION_PATTERNS = [
-  /^[\s.,!?♪♫♬\[\]\(\)\-]+$/,
+  /^[\s.,!?¡¿♪♫♬\[\]\(\)\-]+$/,
+  /(.)\1{6,}/,
   /subt[ií]tulos\s+(realizados|por|creados)/i,
   /gracias\s+por\s+(ver|escuchar)/i,
   /suscr[ií]bete/i,
@@ -163,7 +164,10 @@ async function transcribeWindow(samplesArray, windowStartTime, windowEndTime, la
     const audio = new Float32Array(samplesArray);
     const options = {
       task: 'transcribe',
-      return_timestamps: false
+      return_timestamps: false,
+      max_new_tokens: 48,
+      no_repeat_ngram_size: 3,
+      repetition_penalty: 1.15
     };
     if (language) {
       options.language = language;
