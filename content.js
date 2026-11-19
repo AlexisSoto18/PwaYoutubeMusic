@@ -364,7 +364,7 @@
             <button class="lyrics-action-btn" id="lyrics-offset-inc" title="Advance lyrics (+0.5s)">+0.5s</button>
             <button class="lyrics-action-btn" id="lyrics-font-dec" title="Decrease font size">A-</button>
             <button class="lyrics-action-btn" id="lyrics-font-inc" title="Increase font size">A+</button>
-            <button class="lyrics-action-btn" id="lyrics-copy-diag" title="Copy Network & Audio VAD Diagnostics JSON">LOG</button>
+            <!-- <button class="lyrics-action-btn" id="lyrics-copy-diag" title="Copy Network & Audio VAD Diagnostics JSON">LOG</button> -->
             <span class="lyrics-status-badge">STANDBY</span>
           </div>
         </div>
@@ -415,12 +415,12 @@
 
       const fontDecBtn = container.querySelector('#lyrics-font-dec');
       const fontIncBtn = container.querySelector('#lyrics-font-inc');
-      const copyDiagBtn = container.querySelector('#lyrics-copy-diag');
+      // const copyDiagBtn = container.querySelector('#lyrics-copy-diag');
       fontDecBtn.addEventListener('click', () => setFontSize(currentFontSize - 2));
       fontIncBtn.addEventListener('click', () => setFontSize(currentFontSize + 2));
-      if (copyDiagBtn) {
-        copyDiagBtn.addEventListener('click', () => copyDiagnosticsReport(copyDiagBtn));
-      }
+      // if (copyDiagBtn) {
+      //   copyDiagBtn.addEventListener('click', () => copyDiagnosticsReport(copyDiagBtn));
+      // }
 
       const handleUserManualScroll = () => {
         isUserScrolling = true;
