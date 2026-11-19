@@ -411,20 +411,36 @@
     }
 
     // 2. First Vocal Onset Snap: When the singer enters for the first time,
-    // anchor line 0 cleanly and taper the adjustment instead of shifting the entire song rigidly.
+    // if onset occurs late (>22s) after a long intro, anchor to the first substantial verse
+    // (skipping short 1-2 word intro ad-libs like "Mamá", "Wuh").
     if (vadState.triggeredPhraseOnset && vadState.firstVocalOnsetTime !== null && activeIndex <= 2 && !userAnchors[0]) {
-      const onsetDelta = vadState.firstVocalOnsetTime - parsedLyrics[0].time;
-      if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 22.0) {
-        const taperCount = Math.min(parsedLyrics.length, 6);
-        for (let i = 0; i < taperCount; i++) {
+      let targetIdx = 0;
+      if (vadState.firstVocalOnsetTime >= 22) {
+        while (
+          targetIdx < Math.min(3, parsedLyrics.length - 1) &&
+          parsedLyrics[targetIdx].text.length <= 12 &&
+          parsedLyrics[targetIdx].text.split(/\s+/).length <= 2
+        ) {
+          targetIdx++;
+        }
+      }
+      const onsetDelta = vadState.firstVocalOnsetTime - parsedLyrics[targetIdx].time;
+      if (Math.abs(onsetDelta) >= 0.3 && Math.abs(onsetDelta) <= 25.0) {
+        const taperCount = Math.min(parsedLyrics.length - targetIdx, 6);
+        for (let k = 0; k < taperCount; k++) {
+          const i = targetIdx + k;
           if (Object.prototype.hasOwnProperty.call(userAnchors, i)) break;
-          const weight = 1 - (i / taperCount);
+          const weight = 1 - (k / taperCount);
           const minPrev = i > 0 ? (parsedLyrics[i - 1].time + 0.35) : 0.2;
-          const nextFixed = (i + 1 < parsedLyrics.length && i + 1 === taperCount)
+          const nextFixed = (i + 1 < parsedLyrics.length && k + 1 === taperCount)
             ? parsedLyrics[i + 1].time - 0.35
             : Infinity;
           const shifted = Math.min(nextFixed, Math.max(minPrev, parsedLyrics[i].time + onsetDelta * weight));
           parsedLyrics[i].time = Math.round(shifted * 100) / 100;
+        }
+        // Pull any skipped intro ad-libs just before targetIdx so they never linger after the main verse
+        for (let a = targetIdx - 1; a >= 0; a--) {
+          parsedLyrics[a].time = Math.round(Math.max(0.5, parsedLyrics[a + 1].time - 2.2) * 100) / 100;
         }
         return true;
       }

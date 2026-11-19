@@ -12,8 +12,9 @@
 
   const TARGET_SAMPLE_RATE = 16000;
   const BATCH_SAMPLES_16K = 1024; // 2 x 512-sample Silero v5 frames (~64ms low-latency batch)
-  const WHISPER_WINDOW_SAMPLES = 16000 * 3.6;  // 3.6s vocal audio window for Whisper Tiny
-  const WHISPER_OVERLAP_SAMPLES = 16000 * 0.8; // 0.8s overlap so phrases aren't split across windows
+  const WHISPER_FIRST_WINDOW_SAMPLES = 16000 * 2.2; // Fast 2.2s first window for instant initial lock
+  const WHISPER_WINDOW_SAMPLES = 16000 * 3.4;       // 3.4s steady-state vocal window for Whisper Tiny
+  const WHISPER_OVERLAP_SAMPLES = 16000 * 0.8;      // 0.8s overlap so phrases aren't split across windows
 
   let audioCtx = null;
   let sourceNode = null;
@@ -33,6 +34,7 @@
   // --- Whisper Tiny ASR Rolling Window State ---
   let whisperPcmBuffer = [];
   let whisperWindowStartTime = null;
+  let whisperTrackDispatches = 0;
   let isWhisperInFlight = false;
   let whisperEnabled = false;
   let whisperLanguage = null;
@@ -98,6 +100,7 @@
     pcmQueue16k = [];
     whisperPcmBuffer = [];
     whisperWindowStartTime = null;
+    whisperTrackDispatches = 0;
     pendingModelReset = true;
     sileroProb = 0;
     sileroAvgProb = 0;
@@ -427,13 +430,19 @@
               for (let i = 0; i < downsampled.length; i++) {
                 whisperPcmBuffer.push(downsampled[i]);
               }
-              if (whisperPcmBuffer.length >= WHISPER_WINDOW_SAMPLES) {
-                const winSamples = whisperPcmBuffer.slice(0, WHISPER_WINDOW_SAMPLES);
-                const startT = whisperWindowStartTime ?? Math.max(0, latestAudioTime - 3.6);
+              const targetWindowSamples = whisperTrackDispatches === 0
+                ? WHISPER_FIRST_WINDOW_SAMPLES
+                : WHISPER_WINDOW_SAMPLES;
+
+              if (whisperPcmBuffer.length >= targetWindowSamples) {
+                const winSamples = whisperPcmBuffer.slice(0, targetWindowSamples);
+                const winSec = targetWindowSamples / TARGET_SAMPLE_RATE;
+                const startT = whisperWindowStartTime ?? Math.max(0, latestAudioTime - winSec);
                 const endT = latestAudioTime;
                 // Keep 0.8s overlap so phrases crossing window edges stay intact
-                whisperPcmBuffer = whisperPcmBuffer.slice(WHISPER_WINDOW_SAMPLES - WHISPER_OVERLAP_SAMPLES);
+                whisperPcmBuffer = whisperPcmBuffer.slice(targetWindowSamples - WHISPER_OVERLAP_SAMPLES);
                 whisperWindowStartTime = Math.max(0, endT - 0.8);
+                whisperTrackDispatches++;
                 dispatchWhisperWindow(winSamples, startT, endT);
               }
             } else if (whisperPcmBuffer.length > 16000 * 1.4 && currentSilenceStreakMs >= 900) {
