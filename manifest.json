@@ -44,6 +44,8 @@
     "*://*.ggpht.com/*",
     "*://*.googleusercontent.com/*",
     "*://*.youtube.com/*",
-    "https://lrclib.net/*"
+    "https://lrclib.net/*",
+    "https://huggingface.co/*",
+    "https://*.hf.co/*"
   ]
 }

@@ -12,6 +12,8 @@
 
   const TARGET_SAMPLE_RATE = 16000;
   const BATCH_SAMPLES_16K = 1024; // 2 x 512-sample Silero v5 frames (~64ms low-latency batch)
+  const WHISPER_WINDOW_SAMPLES = 16000 * 3.6;  // 3.6s vocal audio window for Whisper Tiny
+  const WHISPER_OVERLAP_SAMPLES = 16000 * 0.8; // 0.8s overlap so phrases aren't split across windows
 
   let audioCtx = null;
   let sourceNode = null;
@@ -27,6 +29,21 @@
   let isInferInFlight = false;
   let pendingModelReset = true;
   let latestAudioTime = 0;
+
+  // --- Whisper Tiny ASR Rolling Window State ---
+  let whisperPcmBuffer = [];
+  let whisperWindowStartTime = null;
+  let isWhisperInFlight = false;
+  let whisperEnabled = false;
+  let whisperLanguage = null;
+  let whisperStatus = 'idle';
+  let whisperProgress = 0;
+  let whisperDevice = 'wasm';
+  let whisperTranscriptsCount = 0;
+  let whisperLastTranscript = '';
+  let whisperLastLatencyMs = 0;
+  let whisperLastError = null;
+  let lastWhisperStatusPollMs = 0;
 
   // --- Neural Silero VAD State ---
   let sileroReady = false;
@@ -79,6 +96,8 @@
     nonZeroBatchesCount = 0;
     consecutiveZeroBatches = 0;
     pcmQueue16k = [];
+    whisperPcmBuffer = [];
+    whisperWindowStartTime = null;
     pendingModelReset = true;
     sileroProb = 0;
     sileroAvgProb = 0;
@@ -164,6 +183,107 @@
       if (isVocalActive && currentSilenceStreakMs >= 360) {
         isVocalActive = false;
       }
+    }
+  }
+
+  /**
+   * Enable Whisper Tiny ASR and optionally warm up the model for a plain-lyrics track.
+   */
+  function configureWhisper(enabled, language = null) {
+    whisperEnabled = Boolean(enabled);
+    whisperLanguage = language;
+    if (whisperEnabled && whisperStatus === 'idle') {
+      whisperStatus = 'loading';
+      try {
+        chrome.runtime.sendMessage({ type: 'WHISPER_ASR_WARMUP' }, (res) => {
+          void chrome.runtime.lastError;
+          if (res) {
+            whisperStatus = res.status || whisperStatus;
+            whisperProgress = res.progress || whisperProgress;
+            whisperDevice = res.device || whisperDevice;
+            whisperLastError = res.error || null;
+          }
+        });
+      } catch (_) {}
+    }
+  }
+
+  /**
+   * Poll Whisper model download progress while loading so the UI badge can show progress.
+   */
+  function pollWhisperProgressIfLoading() {
+    if (!whisperEnabled || whisperStatus !== 'loading') return;
+    const now = performance.now();
+    if (now - lastWhisperStatusPollMs < 1200) return;
+    lastWhisperStatusPollMs = now;
+
+    try {
+      chrome.runtime.sendMessage({ type: 'WHISPER_ASR_STATUS' }, (res) => {
+        void chrome.runtime.lastError;
+        if (!res) return;
+        whisperStatus = res.status || whisperStatus;
+        whisperProgress = res.progress || whisperProgress;
+        whisperDevice = res.device || whisperDevice;
+        whisperLastError = res.error || null;
+        window.dispatchEvent(new CustomEvent('ytm-lyrics-whisper-status', {
+          detail: { status: whisperStatus, progress: whisperProgress, device: whisperDevice }
+        }));
+      });
+    } catch (_) {}
+  }
+
+  /**
+   * Dispatch a 3.6s vocal audio window to Whisper Tiny in the MV3 Offscreen worker.
+   */
+  function dispatchWhisperWindow(samples, startTime, endTime) {
+    if (!whisperEnabled || isWhisperInFlight) return;
+    isWhisperInFlight = true;
+
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'WHISPER_ASR_TRANSCRIBE',
+          samples,
+          windowStartTime: startTime,
+          windowEndTime: endTime,
+          language: whisperLanguage
+        },
+        (res) => {
+          isWhisperInFlight = false;
+          if (chrome.runtime.lastError) {
+            whisperLastError = chrome.runtime.lastError.message;
+            return;
+          }
+          if (!res) return;
+          whisperStatus = res.status || whisperStatus;
+          whisperProgress = res.progress ?? whisperProgress;
+          whisperDevice = res.device || whisperDevice;
+
+          if (!res.ok) {
+            whisperLastError = res.error || 'Whisper transcription failed';
+            return;
+          }
+
+          whisperLastError = null;
+          whisperTranscriptsCount = res.transcriptsCount || (whisperTranscriptsCount + 1);
+          whisperLastLatencyMs = res.elapsedMs || 0;
+          if (res.text) {
+            whisperLastTranscript = res.text;
+            window.dispatchEvent(new CustomEvent('ytm-lyrics-whisper-transcript', {
+              detail: {
+                text: res.text,
+                windowStartTime: res.windowStartTime,
+                windowEndTime: res.windowEndTime,
+                elapsedMs: res.elapsedMs,
+                device: res.device
+              }
+            }));
+          }
+        }
+      );
+    } catch (err) {
+      isWhisperInFlight = false;
+      whisperLastError = String(err?.message || err);
     }
   }
 
@@ -292,11 +412,42 @@
           if (pcmQueue16k.length >= BATCH_SAMPLES_16K) {
             const batch = pcmQueue16k.slice(0, BATCH_SAMPLES_16K);
             pcmQueue16k = pcmQueue16k.slice(BATCH_SAMPLES_16K);
-            // Prevent unbounded backlog if inference is briefly busy
             if (pcmQueue16k.length > BATCH_SAMPLES_16K * 2) {
               pcmQueue16k = pcmQueue16k.slice(-BATCH_SAMPLES_16K);
             }
             dispatchSileroBatch(batch, latestAudioTime);
+          }
+
+          // Feed Silero-gated vocal audio into Whisper Tiny rolling 3.6s window
+          if (whisperEnabled && sileroReady) {
+            if (isVocalActive || smoothedProb >= 0.28) {
+              if (whisperPcmBuffer.length === 0) {
+                whisperWindowStartTime = Math.max(0, latestAudioTime - 0.15);
+              }
+              for (let i = 0; i < downsampled.length; i++) {
+                whisperPcmBuffer.push(downsampled[i]);
+              }
+              if (whisperPcmBuffer.length >= WHISPER_WINDOW_SAMPLES) {
+                const winSamples = whisperPcmBuffer.slice(0, WHISPER_WINDOW_SAMPLES);
+                const startT = whisperWindowStartTime ?? Math.max(0, latestAudioTime - 3.6);
+                const endT = latestAudioTime;
+                // Keep 0.8s overlap so phrases crossing window edges stay intact
+                whisperPcmBuffer = whisperPcmBuffer.slice(WHISPER_WINDOW_SAMPLES - WHISPER_OVERLAP_SAMPLES);
+                whisperWindowStartTime = Math.max(0, endT - 0.8);
+                dispatchWhisperWindow(winSamples, startT, endT);
+              }
+            } else if (whisperPcmBuffer.length > 16000 * 1.4 && currentSilenceStreakMs >= 900) {
+              // Flush remaining vocal phrase right when a silence/instrumental break begins
+              const winSamples = whisperPcmBuffer.slice();
+              const startT = whisperWindowStartTime ?? Math.max(0, latestAudioTime - (winSamples.length / 16000));
+              const endT = latestAudioTime;
+              whisperPcmBuffer = [];
+              whisperWindowStartTime = null;
+              dispatchWhisperWindow(winSamples, startT, endT);
+            } else if (currentSilenceStreakMs >= 1600 && whisperPcmBuffer.length > 0) {
+              whisperPcmBuffer = [];
+              whisperWindowStartTime = null;
+            }
           }
         };
 
@@ -330,6 +481,7 @@
     }
 
     ensureAttached(video);
+    pollWhisperProgressIfLoading();
 
     if (nonZeroBatchesCount >= 2 && sileroReady) {
       isSignalAvailable = true;
@@ -372,7 +524,7 @@
     })) : [];
 
     return {
-      engine: 'silero-vad-v5-onnx',
+      engine: 'silero-vad-v5 + whisper-tiny-onnx',
       sileroReady,
       sileroLastError,
       inferencesCount,
@@ -389,12 +541,24 @@
       nonZeroBatchesCount,
       isVocalActive,
       hasDetectedFirstVocal,
-      firstVocalOnsetTime
+      firstVocalOnsetTime,
+      whisper: {
+        enabled: whisperEnabled,
+        status: whisperStatus,
+        progress: whisperProgress,
+        device: whisperDevice,
+        language: whisperLanguage,
+        transcriptsCount: whisperTranscriptsCount,
+        lastTranscript: whisperLastTranscript,
+        lastLatencyMs: whisperLastLatencyMs,
+        lastError: whisperLastError
+      }
     };
   }
 
   window.YTMLyrics.AudioVAD = {
     resetTrackState,
+    configureWhisper,
     sampleFrame,
     getState,
     getDiagnostics

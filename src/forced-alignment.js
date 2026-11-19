@@ -487,10 +487,110 @@
     }
   }
 
+  /**
+   * Match a live Whisper Tiny transcript snippet (spanning [windowStartTime..windowEndTime])
+   * against the song's plain lyrics using phonetic bigram similarity in a monotonic neighborhood.
+   * When matched, locks an automatic ASR anchor and re-solves upcoming lines with local tempo learning.
+   */
+  function alignFromWhisperTranscript(
+    plainText,
+    transcriptText,
+    windowStartTime,
+    windowEndTime,
+    currentActiveIndex,
+    durationSeconds,
+    existingAnchors = {}
+  ) {
+    const { phoneticSimilarity } = window.YTMLyrics.Phonetics;
+    const units = buildPhoneticLineUnits(plainText);
+    if (!units.length || !transcriptText || transcriptText.trim().length < 4) {
+      return { matched: false };
+    }
+
+    const words = transcriptText.trim().split(/\s+/).filter(Boolean);
+    if (words.length < 2) {
+      return { matched: false };
+    }
+
+    // Build sliding sub-phrases from the transcript with fractional temporal positions
+    const phrases = [{ text: transcriptText.trim(), startRatio: 0 }];
+    for (let i = 0; i < words.length; i++) {
+      let chunk = '';
+      for (let len = 1; len <= 10 && (i + len) <= words.length; len++) {
+        chunk += (len > 1 ? ' ' : '') + words[i + len - 1];
+        if (len >= 2) {
+          phrases.push({
+            text: chunk,
+            startRatio: i / Math.max(1, words.length)
+          });
+        }
+      }
+    }
+
+    const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
+    const anchorCount = Object.keys(existingAnchors || {}).length;
+    const expectedLineByTime = Math.floor((windowStartTime / dur) * units.length);
+    const centerIdx = currentActiveIndex >= 0 ? currentActiveIndex : expectedLineByTime;
+
+    // Search a monotonic window around the current/expected line to prevent jumping to repeated choruses
+    const searchStart = Math.max(0, centerIdx - (anchorCount > 0 ? 3 : 6));
+    const searchEnd = Math.min(units.length - 1, centerIdx + (anchorCount > 0 ? 12 : 18));
+
+    let bestLineIdx = -1;
+    let bestScore = 0;
+    let bestSim = 0;
+    let bestStartRatio = 0;
+
+    for (let i = searchStart; i <= searchEnd; i++) {
+      const unit = units[i];
+      // Skip very short ad-libs ("Uh", "Wuh") that cause false phonetic matches
+      if (unit.text.length < 6) continue;
+
+      const distPenalty = Math.abs(i - centerIdx) * 0.012;
+
+      for (const phrase of phrases) {
+        const sim = phoneticSimilarity(unit.text, phrase.text);
+        const score = sim - distPenalty;
+        if (sim >= 0.44 && score > bestScore) {
+          bestScore = score;
+          bestSim = sim;
+          bestLineIdx = i;
+          bestStartRatio = phrase.startRatio;
+        }
+      }
+    }
+
+    if (bestLineIdx === -1) {
+      return { matched: false };
+    }
+
+    const windowSpan = Math.max(0.6, windowEndTime - windowStartTime);
+    const estimatedLineTime = Math.round((windowStartTime + bestStartRatio * windowSpan) * 100) / 100;
+
+    const result = realignFromUserAnchor(
+      plainText,
+      bestLineIdx,
+      estimatedLineTime,
+      dur,
+      existingAnchors
+    );
+
+    return {
+      matched: true,
+      matchedIndex: bestLineIdx,
+      matchedLine: units[bestLineIdx].text,
+      matchedTime: estimatedLineTime,
+      similarity: Math.round(bestSim * 100) / 100,
+      lines: result.lines,
+      anchors: result.anchors
+    };
+  }
+
   window.YTMLyrics.ForcedAlignment = {
     buildPhoneticLineUnits,
     alignLyrics,
     realignFromUserAnchor,
-    applyLiveVADNudge
+    applyLiveVADNudge,
+    alignFromWhisperTranscript
   };
 })();

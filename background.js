@@ -91,4 +91,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true;
   }
+
+  if (message?.type === 'WHISPER_ASR_TRANSCRIBE') {
+    (async () => {
+      try {
+        await ensureOffscreenDocument();
+        const result = await chrome.runtime.sendMessage({
+          type: 'OFFSCREEN_WHISPER_TRANSCRIBE',
+          samples: message.samples,
+          windowStartTime: message.windowStartTime,
+          windowEndTime: message.windowEndTime,
+          language: message.language || null
+        });
+        sendResponse(result || { ok: false, error: 'Empty Whisper offscreen response' });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
+  }
+
+  if (message?.type === 'WHISPER_ASR_STATUS' || message?.type === 'WHISPER_ASR_WARMUP') {
+    (async () => {
+      try {
+        await ensureOffscreenDocument();
+        const targetType = message.type === 'WHISPER_ASR_WARMUP'
+          ? 'OFFSCREEN_WHISPER_WARMUP'
+          : 'OFFSCREEN_WHISPER_STATUS';
+        const result = await chrome.runtime.sendMessage({ type: targetType });
+        sendResponse(result || { ok: false, error: 'Empty Whisper status response' });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
+  }
 });

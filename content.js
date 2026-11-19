@@ -27,11 +27,13 @@
   const {
     alignLyrics,
     realignFromUserAnchor,
-    applyLiveVADNudge
+    applyLiveVADNudge,
+    alignFromWhisperTranscript
   } = window.YTMLyrics.ForcedAlignment;
 
   const {
     resetTrackState: resetVADState,
+    configureWhisper,
     sampleFrame: sampleVADFrame,
     getDiagnostics: getVADDiagnostics
   } = window.YTMLyrics.AudioVAD;
@@ -45,6 +47,8 @@
   let currentASRSegments = [];
   let latestNetDiagnostics = [];
   let currentUserAnchors = {};
+  let currentWhisperAnchors = {};
+  let lastWhisperMatch = null;
   let savedAnchorsBySong = {};
   let parsedLyrics = [];
   let isSynced = false;
@@ -121,8 +125,73 @@
       parsedLyrics = lines;
       isPredictedSync = false;
       alignmentModeLabel = 'YTM SYNCED';
+      configureWhisper(false);
       activeIndex = -2;
       updateBadgeDisplay();
+    }
+  });
+
+  /**
+   * Heuristic language hint for Whisper Tiny so Spanish lyrics transcribe faster and more accurately.
+   */
+  function detectLyricsLanguage(plainText) {
+    const sample = (plainText || '').slice(0, 600).toLowerCase();
+    if (/[áéíóúñ¿¡]/.test(sample)) return 'spanish';
+    const spanishHits = (sample.match(/\b(que|para|pero|como|cuando|donde|todo|nada|quiero|amor|vida|conmigo|contigo|estoy|estás)\b/g) || []).length;
+    return spanishHits >= 3 ? 'spanish' : null;
+  }
+
+  window.addEventListener('ytm-lyrics-whisper-status', (e) => {
+    const detail = e.detail;
+    if (!detail || !isPredictedSync) return;
+    if (Object.keys(currentUserAnchors).length > 0) return;
+
+    if (detail.status === 'loading' && typeof detail.progress === 'number') {
+      alignmentModeLabel = `WHISPER (${detail.progress}%)`;
+      updateBadgeDisplay();
+    } else if (detail.status === 'ready' && !alignmentModeLabel.startsWith('WHISPER AI')) {
+      alignmentModeLabel = 'WHISPER AI';
+      updateBadgeDisplay();
+    }
+  });
+
+  window.addEventListener('ytm-lyrics-whisper-transcript', (e) => {
+    const detail = e.detail;
+    if (!detail || !detail.text || !isPredictedSync || !currentLyricsData || currentLyricsData.type !== 'plain') {
+      return;
+    }
+
+    const dur = getExpectedTrackDuration(false) || lastPredictedDuration || 180;
+    const combinedAnchors = { ...currentWhisperAnchors, ...currentUserAnchors };
+
+    const match = alignFromWhisperTranscript(
+      currentLyricsData.lyrics,
+      detail.text,
+      detail.windowStartTime,
+      detail.windowEndTime,
+      activeIndex,
+      dur,
+      combinedAnchors
+    );
+
+    if (match && match.matched && match.lines.length > 0) {
+      // Only accept automatic Whisper anchor if the user hasn't manually pinned that exact line
+      if (!Object.prototype.hasOwnProperty.call(currentUserAnchors, match.matchedIndex)) {
+        currentWhisperAnchors[match.matchedIndex] = match.matchedTime;
+      }
+      parsedLyrics = match.lines;
+      lastWhisperMatch = {
+        transcript: detail.text,
+        matchedIndex: match.matchedIndex,
+        matchedLine: match.matchedLine,
+        matchedTime: match.matchedTime,
+        similarity: match.similarity,
+        elapsedMs: detail.elapsedMs
+      };
+      if (Object.keys(currentUserAnchors).length === 0) {
+        alignmentModeLabel = 'WHISPER AI';
+        updateBadgeDisplay();
+      }
     }
   });
 
@@ -151,6 +220,8 @@
         lyricsType: currentLyricsData?.type || 'none',
         asrSegmentsCount: currentASRSegments.length,
         userAnchors: currentUserAnchors,
+        whisperAnchors: currentWhisperAnchors,
+        lastWhisperMatch,
         sampleLines: parsedLyrics.slice(0, 8)
       },
       audioVAD: getVADDiagnostics(video),
@@ -207,6 +278,7 @@
 
     const isForcedOrAnchored = alignmentModeLabel === 'FORCED-ALIGN'
       || alignmentModeLabel === 'LIVE VAD'
+      || alignmentModeLabel.startsWith('WHISPER')
       || alignmentModeLabel.startsWith('ANCHORED');
 
     statusBadgeEl.className = 'lyrics-status-badge ' + (
@@ -388,6 +460,7 @@
     if (!data) {
       isSynced = false;
       isPredictedSync = false;
+      configureWhisper(false);
       parsedLyrics = [];
       activeIndex = -1;
       if (statusBadgeEl) {
@@ -416,12 +489,14 @@
       parsedLyrics = aligned.lines;
       const userAnchorCount = Object.keys(currentUserAnchors).length;
       alignmentModeLabel = userAnchorCount > 0 ? `ANCHORED (${userAnchorCount})` : aligned.mode;
+      configureWhisper(true, detectLyricsLanguage(data.lyrics));
       scrollBoxEl.classList.remove('plain-mode');
       updateBadgeDisplay();
     } else {
       isSynced = true;
       isPredictedSync = false;
       alignmentModeLabel = 'SYNCED';
+      configureWhisper(false);
       scrollBoxEl.classList.remove('plain-mode');
       parsedLyrics = parseLRC(data.lyrics);
       updateBadgeDisplay();
@@ -744,6 +819,9 @@
     currentLRCLIBResults = null;
     currentASRSegments = [];
     currentUserAnchors = savedAnchorsBySong[songKey] ? { ...savedAnchorsBySong[songKey] } : {};
+    currentWhisperAnchors = {};
+    lastWhisperMatch = null;
+    configureWhisper(false);
     resetVADState();
 
     if (syncAnimationFrameId) {
