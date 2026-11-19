@@ -100,7 +100,7 @@
    * Fetch synced or plain lyrics from LRCLIB via Background Service Worker,
    * falling back to native YouTube Music DOM lyrics.
    */
-  async function fetchLyrics(track, rawArtist, targetDuration) {
+  async function fetchLyrics(track, rawArtist, targetDuration, staleNativeText = '') {
     const { full: fullArtist, primary: primaryArtist } = extractArtists(rawArtist);
     const cleanedTitle = cleanTrackTitle(track);
     const { getNativeYTMLyrics } = window.YTMLyrics.PlayerClock;
@@ -142,7 +142,7 @@
     }
 
     const nativeLyrics = getNativeYTMLyrics();
-    if (nativeLyrics) {
+    if (nativeLyrics && nativeLyrics !== staleNativeText) {
       return {
         match: { type: 'plain', lyrics: nativeLyrics, source: 'ytm' },
         rawResults: null

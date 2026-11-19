@@ -61,6 +61,8 @@
   let userScrollTimer = null;
   let isUserScrolling = false;
   let activeRequestId = 0;
+  let isFetchingTrackLyrics = false;
+  let staleNativeLyricsText = '';
   let lastVideoTime = 0;
   let currentFontSize = 26;
   let awaitingVideoReset = false;
@@ -459,7 +461,7 @@
     scrollBoxEl.classList.remove('plain-mode');
     scrollBoxEl.innerHTML = `
       <div class="lyrics-empty-state">
-        <div class="lyrics-empty-icon">⏳</div>
+        <div class="lyrics-empty-icon">...</div>
         <div class="lyrics-empty-title">Searching Lyrics</div>
         <div class="lyrics-empty-desc">Looking up lyrics for ${title} by ${artist}...</div>
       </div>
@@ -838,6 +840,9 @@
 
     activeRequestId++;
     const thisRequestId = activeRequestId;
+    isFetchingTrackLyrics = true;
+    // Snapshot the previous song's native DOM lyrics so we never accidentally attach them to the new track
+    staleNativeLyricsText = getNativeYTMLyrics() || '';
 
     currentSongKey = songKey;
     currentTitle = title;
@@ -873,10 +878,11 @@
     renderLoadingState(title, artist);
 
     const targetDuration = getExpectedTrackDuration(awaitingVideoReset);
-    const { match, rawResults } = await fetchLyrics(title, artist, targetDuration);
+    const { match, rawResults } = await fetchLyrics(title, artist, targetDuration, staleNativeLyricsText);
 
     if (thisRequestId !== activeRequestId) return;
 
+    isFetchingTrackLyrics = false;
     currentLRCLIBResults = rawResults;
     renderLyrics(match, title);
   }
@@ -937,25 +943,25 @@
         checkTrackChange();
       }
 
+      if (isFetchingTrackLyrics) return;
+
       const shelf = getPlayerLyricsShelf();
       if (shelf) {
         const container = document.getElementById('ytm-embedded-lyrics-container');
+        const liveNative = getNativeYTMLyrics();
+        const hasFreshNative = Boolean(liveNative && liveNative !== staleNativeLyricsText);
+
         if (!container || container.parentNode !== shelf) {
           if (currentSongKey) {
-            if (!currentLyricsData) {
-              const native = getNativeYTMLyrics();
-              if (native) {
-                currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
-              }
+            if (!currentLyricsData && hasFreshNative) {
+              currentLyricsData = { type: 'plain', lyrics: liveNative, source: 'ytm' };
             }
             renderLyrics(currentLyricsData, currentTitle);
           }
-        } else if (!currentLyricsData && statusBadgeEl && statusBadgeEl.textContent === 'NO LYRICS') {
-          const native = getNativeYTMLyrics();
-          if (native) {
-            currentLyricsData = { type: 'plain', lyrics: native, source: 'ytm' };
-            renderLyrics(currentLyricsData, currentTitle);
-          }
+        } else if (hasFreshNative && (!currentLyricsData || (currentLyricsData.source === 'ytm' && currentLyricsData.lyrics !== liveNative))) {
+          // YouTube Music finished loading the new track's native lyrics into the DOM
+          currentLyricsData = { type: 'plain', lyrics: liveNative, source: 'ytm' };
+          renderLyrics(currentLyricsData, currentTitle);
         }
       }
     });
