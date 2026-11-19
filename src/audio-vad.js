@@ -1,8 +1,8 @@
 /**
- * YTM Sync Lyrics - Real-Time Acoustic Vocal Activity Detector (VAD)
- * Uses a non-destructive Web Audio tap (video.captureStream() -> AnalyserNode)
- * to analyze the vocal formant frequency band (300 Hz - 3400 Hz), syllabic modulation,
- * and spectral flux in real time without altering or muting native playback routing.
+ * YTM Sync Lyrics - Neural Vocal Activity Detector (Silero VAD v5 ONNX / WebAssembly)
+ * Uses a passive, non-destructive video.captureStream() tap -> 16kHz PCM downsampler ->
+ * MV3 Offscreen ONNX Runtime Web (Silero VAD v5) to separate real human singing voice
+ * from loud instrumental intros, requintos, guitars, and percussion.
  */
 
 (() => {
@@ -10,44 +10,92 @@
 
   window.YTMLyrics = window.YTMLyrics || {};
 
+  const TARGET_SAMPLE_RATE = 16000;
+  const BATCH_SAMPLES_16K = 1536; // 3 x 512-sample Silero v5 frames (~96ms per IPC batch)
+
   let audioCtx = null;
-  let analyser = null;
   let sourceNode = null;
+  let processorNode = null;
+  let silentGainNode = null;
   let attachedVideo = null;
   let attachedStream = null;
-  let freqBuffer = null;
-  let timeBuffer = null;
-
-  // --- Acoustic VAD State ---
-  let isSignalAvailable = false;
-  let nonZeroFramesCount = 0;
-  let consecutiveZeroFrames = 0;
   let attachedSrc = '';
   let lastAttachAttemptMs = 0;
-  let rollingNoiseFloor = 18;
-  let rollingPeakVocal = 75;
-  let smoothedVocalScore = 0;
-  let prevVocalBandEnergy = 0;
 
+  // --- PCM Downsampling & IPC Batch State ---
+  let pcmQueue16k = [];
+  let isInferInFlight = false;
+  let pendingModelReset = true;
+  let latestAudioTime = 0;
+
+  // --- Neural Silero VAD State ---
+  let sileroReady = false;
+  let sileroLastError = null;
+  let inferencesCount = 0;
+  let sileroProb = 0;
+  let sileroAvgProb = 0;
+  let smoothedProb = 0;
+  let peakPcmAmplitude = 0;
+  let nonZeroBatchesCount = 0;
+  let consecutiveZeroBatches = 0;
+
+  let isSignalAvailable = false;
   let isVocalActive = false;
   let hasDetectedFirstVocal = false;
   let firstVocalOnsetTime = null;
   let lastVocalActiveAudioTime = 0;
-  let lastSilenceStartAudioTime = 0;
   let lastPhraseOnsetAudioTime = -10;
   let currentVocalStreakMs = 0;
   let currentSilenceStreakMs = 0;
-  let lastSampleWallTime = 0;
+  let pendingPhraseOnset = false;
+  let lastEvalWallTime = 0;
 
   /**
-   * Reset VAD tracking state on track change and force fresh stream re-attachment.
+   * Downsample Float32 PCM buffer from inputSampleRate (e.g. 48000Hz) to 16000Hz via linear interpolation.
+   */
+  function downsampleTo16k(inputFloat32, inputSampleRate) {
+    if (inputSampleRate === TARGET_SAMPLE_RATE) {
+      return inputFloat32;
+    }
+    const ratio = inputSampleRate / TARGET_SAMPLE_RATE;
+    const outputLength = Math.floor(inputFloat32.length / ratio);
+    const output = new Float32Array(outputLength);
+
+    for (let i = 0; i < outputLength; i++) {
+      const srcIdx = i * ratio;
+      const idx0 = Math.floor(srcIdx);
+      const idx1 = Math.min(inputFloat32.length - 1, idx0 + 1);
+      const frac = srcIdx - idx0;
+      output[i] = inputFloat32[idx0] * (1 - frac) + inputFloat32[idx1] * frac;
+    }
+    return output;
+  }
+
+  /**
+   * Reset neural VAD tracking state on track change and force fresh stream + LSTM state reset.
    */
   function resetTrackState() {
     isSignalAvailable = false;
-    nonZeroFramesCount = 0;
-    consecutiveZeroFrames = 0;
+    nonZeroBatchesCount = 0;
+    consecutiveZeroBatches = 0;
+    pcmQueue16k = [];
+    pendingModelReset = true;
+    sileroProb = 0;
+    sileroAvgProb = 0;
+    smoothedProb = 0;
+    peakPcmAmplitude = 0;
+    isVocalActive = false;
+    hasDetectedFirstVocal = false;
+    firstVocalOnsetTime = null;
+    lastVocalActiveAudioTime = 0;
+    lastPhraseOnsetAudioTime = -10;
+    currentVocalStreakMs = 0;
+    currentSilenceStreakMs = 0;
+    pendingPhraseOnset = false;
     attachedSrc = '';
     lastAttachAttemptMs = 0;
+    lastEvalWallTime = performance.now();
+
     if (sourceNode) {
       try {
         sourceNode.disconnect();
@@ -56,24 +104,110 @@
     }
     attachedVideo = null;
     attachedStream = null;
-    rollingNoiseFloor = 18;
-    rollingPeakVocal = 75;
-    smoothedVocalScore = 0;
-    prevVocalBandEnergy = 0;
-    isVocalActive = false;
-    hasDetectedFirstVocal = false;
-    firstVocalOnsetTime = null;
-    lastVocalActiveAudioTime = 0;
-    lastSilenceStartAudioTime = 0;
-    lastPhraseOnsetAudioTime = -10;
-    currentVocalStreakMs = 0;
-    currentSilenceStreakMs = 0;
-    lastSampleWallTime = performance.now();
+
+    try {
+      chrome.runtime.sendMessage({ type: 'SILERO_VAD_RESET' }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_) {}
+  }
+
+  /**
+   * Update vocal activity state machine from Silero VAD v5 neural speech probability.
+   */
+  function ingestSileroProbability(maxProb, avgProb, batchAudioTime) {
+    const now = performance.now();
+    const dtMs = lastEvalWallTime > 0 ? Math.min(250, Math.max(40, now - lastEvalWallTime)) : 96;
+    lastEvalWallTime = now;
+
+    sileroProb = maxProb;
+    sileroAvgProb = avgProb;
+
+    // Fast attack, smooth release on neural voice probability
+    const effectiveProb = maxProb * 0.65 + avgProb * 0.35;
+    const alpha = effectiveProb > smoothedProb ? 0.55 : 0.30;
+    smoothedProb = smoothedProb * (1 - alpha) + effectiveProb * alpha;
+
+    // Silero VAD v5 thresholds: instruments/requintos stay < 0.22, human voice > 0.52
+    const onsetThreshold = 0.52;
+    const sustainThreshold = 0.32;
+    const frameHasVoice = isVocalActive
+      ? (smoothedProb >= sustainThreshold)
+      : (smoothedProb >= onsetThreshold);
+
+    if (frameHasVoice) {
+      currentVocalStreakMs += dtMs;
+      currentSilenceStreakMs = 0;
+
+      if (!isVocalActive && currentVocalStreakMs >= 120) {
+        const prevSilenceSec = batchAudioTime - lastVocalActiveAudioTime;
+        isVocalActive = true;
+
+        if (!hasDetectedFirstVocal && batchAudioTime >= 0.8) {
+          hasDetectedFirstVocal = true;
+          firstVocalOnsetTime = Math.max(0.4, batchAudioTime - 0.14);
+          pendingPhraseOnset = true;
+          lastPhraseOnsetAudioTime = firstVocalOnsetTime;
+        } else if (prevSilenceSec >= 0.45 && (batchAudioTime - lastPhraseOnsetAudioTime) >= 1.1) {
+          pendingPhraseOnset = true;
+          lastPhraseOnsetAudioTime = Math.max(0.4, batchAudioTime - 0.10);
+        }
+      }
+
+      if (isVocalActive) {
+        lastVocalActiveAudioTime = batchAudioTime;
+      }
+    } else {
+      currentSilenceStreakMs += dtMs;
+      currentVocalStreakMs = 0;
+
+      if (isVocalActive && currentSilenceStreakMs >= 360) {
+        isVocalActive = false;
+      }
+    }
+  }
+
+  /**
+   * Dispatch a 16kHz PCM batch to the MV3 Offscreen Silero VAD v5 ONNX engine.
+   */
+  function dispatchSileroBatch(batchSamples, batchAudioTime) {
+    if (isInferInFlight) return;
+    isInferInFlight = true;
+    const shouldReset = pendingModelReset;
+    pendingModelReset = false;
+
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'SILERO_VAD_INFER',
+          samples: batchSamples,
+          reset: shouldReset
+        },
+        (res) => {
+          isInferInFlight = false;
+          if (chrome.runtime.lastError) {
+            sileroLastError = chrome.runtime.lastError.message;
+            return;
+          }
+          if (!res || !res.ok) {
+            sileroLastError = res?.error || 'Silero inference failed';
+            return;
+          }
+          sileroReady = Boolean(res.modelReady);
+          sileroLastError = null;
+          inferencesCount++;
+          ingestSileroProbability(res.prob || 0, res.avgProb || 0, batchAudioTime);
+        }
+      );
+    } catch (err) {
+      isInferInFlight = false;
+      sileroLastError = String(err?.message || err);
+    }
   }
 
   /**
    * Attach a passive, non-destructive audio tap to the active <video> element via captureStream().
-   * Does not reroute <video> output, guaranteeing playback can never be silenced.
+   * Only re-attaches when <video>.currentSrc changes or the isolated track ends.
    */
   function ensureAttached(video) {
     if (!video) return false;
@@ -93,12 +227,10 @@
       const hasLiveTrack = Boolean(attachedStream) &&
         attachedStream.getAudioTracks().some(t => t.readyState === 'live');
 
-      // Fast path: same <video>, same MSE blob source, track still live -> reuse (no captureStream call)
-      if (attachedVideo === video && analyser && hasLiveTrack && currentSrc === attachedSrc) {
+      if (attachedVideo === video && processorNode && hasLiveTrack && currentSrc === attachedSrc) {
         return true;
       }
 
-      // Rate-limit re-attach attempts (captureStream() creates new tracks on every call)
       const nowMs = performance.now();
       if (nowMs - lastAttachAttemptMs < 1000) {
         return hasLiveTrack;
@@ -112,9 +244,7 @@
       if (!rawStream) return false;
 
       const liveAudioTracks = rawStream.getAudioTracks().filter(t => t.readyState === 'live');
-      if (liveAudioTracks.length === 0) {
-        return false;
-      }
+      if (liveAudioTracks.length === 0) return false;
 
       if (sourceNode) {
         try {
@@ -122,206 +252,99 @@
         } catch (_) {}
       }
 
-      if (!analyser) {
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.65;
-        freqBuffer = new Uint8Array(analyser.frequencyBinCount);
-        timeBuffer = new Uint8Array(analyser.fftSize);
+      if (!processorNode) {
+        processorNode = audioCtx.createScriptProcessor(2048, 1, 1);
+        silentGainNode = audioCtx.createGain();
+        silentGainNode.gain.value = 0;
+
+        processorNode.onaudioprocess = (event) => {
+          if (!attachedVideo || attachedVideo.paused) return;
+          const input = event.inputBuffer.getChannelData(0);
+
+          let maxAmp = 0;
+          for (let i = 0; i < input.length; i += 4) {
+            const abs = Math.abs(input[i]);
+            if (abs > maxAmp) maxAmp = abs;
+          }
+          peakPcmAmplitude = Math.round(maxAmp * 1000) / 1000;
+
+          if (maxAmp < 0.0005) {
+            consecutiveZeroBatches++;
+            if (consecutiveZeroBatches >= 25) {
+              isSignalAvailable = false;
+              nonZeroBatchesCount = 0;
+              attachedStream = null;
+            }
+            return;
+          }
+
+          consecutiveZeroBatches = 0;
+          nonZeroBatchesCount++;
+          if (nonZeroBatchesCount >= 2 && sileroReady) {
+            isSignalAvailable = true;
+          }
+
+          const downsampled = downsampleTo16k(input, audioCtx.sampleRate || 48000);
+          for (let i = 0; i < downsampled.length; i++) {
+            pcmQueue16k.push(downsampled[i]);
+          }
+
+          if (pcmQueue16k.length >= BATCH_SAMPLES_16K) {
+            const batch = pcmQueue16k.slice(0, BATCH_SAMPLES_16K);
+            pcmQueue16k = pcmQueue16k.slice(BATCH_SAMPLES_16K);
+            // Prevent unbounded backlog if inference is briefly busy
+            if (pcmQueue16k.length > BATCH_SAMPLES_16K * 2) {
+              pcmQueue16k = pcmQueue16k.slice(-BATCH_SAMPLES_16K);
+            }
+            dispatchSileroBatch(batch, latestAudioTime);
+          }
+        };
+
+        processorNode.connect(silentGainNode);
+        silentGainNode.connect(audioCtx.destination);
       }
 
-      // Isolate the newest live audio track (the one bound to the current MSE source)
       const latestTrack = liveAudioTracks[liveAudioTracks.length - 1];
       const isolatedStream = new MediaStream([latestTrack]);
 
       sourceNode = audioCtx.createMediaStreamSource(isolatedStream);
-      // Connect ONLY to analyser (never to audioCtx.destination) so native audio output is untouched
-      sourceNode.connect(analyser);
+      sourceNode.connect(processorNode);
 
       attachedVideo = video;
       attachedStream = isolatedStream;
       attachedSrc = currentSrc;
       return true;
     } catch (e) {
+      sileroLastError = String(e?.message || e);
       return false;
     }
   }
 
   /**
-   * Sample the current FFT spectrum and update Vocal Activity Detection state.
-   * Distinguishes singing voice (F1/F2 vocal formants 300-3200Hz + harmonic richness)
-   * from sub-bass/kick (45-180Hz) and high-frequency percussion (5500-11000Hz).
+   * Called from the 60fps sync loop to keep stream attached and return latest Silero VAD state.
    */
   function sampleFrame(video, currentAudioTime) {
-    if (!video || video.paused) return getState(currentAudioTime);
-    if (!ensureAttached(video) || !analyser || !freqBuffer) {
+    latestAudioTime = currentAudioTime;
+    if (!video || video.paused) {
       return getState(currentAudioTime);
     }
 
-    const now = performance.now();
-    const dtMs = lastSampleWallTime > 0 ? Math.min(200, Math.max(8, now - lastSampleWallTime)) : 16;
-    lastSampleWallTime = now;
+    ensureAttached(video);
 
-    analyser.getByteFrequencyData(freqBuffer);
-
-    const sampleRate = audioCtx.sampleRate || 48000;
-    const binHz = sampleRate / analyser.fftSize; // ~23.4 Hz per bin at 48kHz
-
-    const bassStart = Math.max(1, Math.floor(45 / binHz));
-    const bassEnd = Math.floor(190 / binHz);
-
-    // Core vocal fundamental + F1/F2 vowel formants (300 Hz - 3200 Hz)
-    const vocalStart = Math.floor(300 / binHz);
-    const vocalCoreStart = Math.floor(420 / binHz);
-    const vocalCoreEnd = Math.floor(2400 / binHz);
-    const vocalEnd = Math.floor(3300 / binHz);
-
-    const highStart = Math.floor(5500 / binHz);
-    const highEnd = Math.min(freqBuffer.length - 1, Math.floor(11500 / binHz));
-
-    let bassSum = 0;
-    let bassCount = 0;
-    for (let i = bassStart; i <= bassEnd; i++) {
-      bassSum += freqBuffer[i];
-      bassCount++;
-    }
-
-    let vocalSum = 0;
-    let vocalWeightSum = 0;
-    let activeFormantBins = 0;
-    let maxBinVal = 0;
-
-    for (let i = vocalStart; i <= vocalEnd; i++) {
-      const val = freqBuffer[i];
-      if (val > maxBinVal) maxBinVal = val;
-      // Weight F1-F2 vowel formant core (420-2400Hz) higher
-      const weight = (i >= vocalCoreStart && i <= vocalCoreEnd) ? 1.45 : 0.85;
-      vocalSum += val * weight;
-      vocalWeightSum += weight;
-      if (val > rollingNoiseFloor + 22) {
-        activeFormantBins++;
-      }
-    }
-
-    let highSum = 0;
-    let highCount = 0;
-    for (let i = highStart; i <= highEnd; i++) {
-      highSum += freqBuffer[i];
-      highCount++;
-    }
-
-    const bassEnergy = bassCount > 0 ? (bassSum / bassCount) : 0;
-    const vocalBandEnergy = vocalWeightSum > 0 ? (vocalSum / vocalWeightSum) : 0;
-    const highEnergy = highCount > 0 ? (highSum / highCount) : 0;
-
-    // Digital silence (all-zero FFT) means the tap is stale/disconnected, NOT that the singer is silent.
-    // Never feed it into the VAD, otherwise Intro Hold / Bridge Freeze push lyrics forward incorrectly.
-    if (!(maxBinVal > 3 || bassEnergy > 3)) {
-      consecutiveZeroFrames++;
-      if (consecutiveZeroFrames >= 45) {
-        isSignalAvailable = false;
-        nonZeroFramesCount = 0;
-        attachedStream = null; // force a (rate-limited) re-attach
-      }
-      return { ...getState(currentAudioTime), isSignalAvailable: false };
-    }
-
-    consecutiveZeroFrames = 0;
-    nonZeroFramesCount++;
-    if (nonZeroFramesCount >= 5) {
+    if (nonZeroBatchesCount >= 2 && sileroReady) {
       isSignalAvailable = true;
     }
 
-    if (!isSignalAvailable) {
-      return getState(currentAudioTime);
-    }
-
-    // Formant broadband fullness: singing voice excites many harmonic bins across 300-3300Hz,
-    // whereas a single guitar/accordion note excites fewer narrow bins.
-    const totalVocalBins = Math.max(1, vocalEnd - vocalStart + 1);
-    const harmonicCoverage = activeFormantBins / totalVocalBins;
-
-    // Spectral flux in the vocal band (detects syllable articulation)
-    const vocalFlux = Math.abs(vocalBandEnergy - prevVocalBandEnergy);
-    prevVocalBandEnergy = vocalBandEnergy;
-
-    // Suppress pure bass thumps, guitar/requinto body (bassEnergy), and hi-hat/pick transients
-    const accompanimentPenalty = Math.max(0, (bassEnergy - vocalBandEnergy * 0.85) * 0.35) + (highEnergy * 0.22);
-    const fluxBoost = Math.min(1.25, 0.8 + (vocalFlux * 0.08));
-    const rawVocalSignal = Math.max(0, (vocalBandEnergy - accompanimentPenalty) * (0.7 + 0.45 * Math.min(1, harmonicCoverage * 2.0)) * fluxBoost);
-
-    // Update adaptive rolling floor WITHOUT chasing active vocal peaks (prevents adaptation poisoning)
-    if (rawVocalSignal < rollingNoiseFloor) {
-      rollingNoiseFloor = rollingNoiseFloor * 0.90 + rawVocalSignal * 0.10;
-    } else if (rawVocalSignal < rollingNoiseFloor + 10) {
-      rollingNoiseFloor = rollingNoiseFloor * 0.985 + rawVocalSignal * 0.015;
-    } else {
-      // Gently relax floor downward during sustained singing so the voice isn't swallowed
-      rollingNoiseFloor = rollingNoiseFloor * 0.999 + 25 * 0.001;
-    }
-    rollingNoiseFloor = Math.max(12, Math.min(95, rollingNoiseFloor));
-
-    if (rawVocalSignal > rollingPeakVocal) {
-      rollingPeakVocal = rollingPeakVocal * 0.90 + rawVocalSignal * 0.10;
-    } else {
-      rollingPeakVocal = Math.max(rollingNoiseFloor + 22, rollingPeakVocal * 0.997);
-    }
-
-    const dynamicRange = Math.max(18, rollingPeakVocal - rollingNoiseFloor);
-    const instantaneousScore = Math.max(0, Math.min(1, (rawVocalSignal - rollingNoiseFloor) / dynamicRange));
-
-    // Smooth score with fast attack and moderate release
-    const alpha = instantaneousScore > smoothedVocalScore ? 0.35 : 0.18;
-    smoothedVocalScore = smoothedVocalScore * (1 - alpha) + instantaneousScore * alpha;
-
-    // Hysteresis thresholds for vocal activity
-    const onsetThreshold = 0.46;
-    const sustainThreshold = 0.31;
-    const frameHasVoice = isVocalActive
-      ? (smoothedVocalScore >= sustainThreshold)
-      : (smoothedVocalScore >= onsetThreshold && harmonicCoverage >= 0.18 && vocalFlux >= 0.4);
-
-    let triggeredPhraseOnset = false;
-
-    if (frameHasVoice) {
-      currentVocalStreakMs += dtMs;
-      currentSilenceStreakMs = 0;
-
-      if (!isVocalActive && currentVocalStreakMs >= 130) {
-        const prevSilenceSec = currentAudioTime - lastVocalActiveAudioTime;
-        isVocalActive = true;
-
-        if (!hasDetectedFirstVocal && currentAudioTime >= 0.8) {
-          hasDetectedFirstVocal = true;
-          firstVocalOnsetTime = Math.max(0.4, currentAudioTime - 0.12);
-          triggeredPhraseOnset = true;
-          lastPhraseOnsetAudioTime = firstVocalOnsetTime;
-        } else if (prevSilenceSec >= 0.42 && (currentAudioTime - lastPhraseOnsetAudioTime) >= 1.1) {
-          triggeredPhraseOnset = true;
-          lastPhraseOnsetAudioTime = Math.max(0.4, currentAudioTime - 0.08);
-        }
-      }
-
-      if (isVocalActive) {
-        lastVocalActiveAudioTime = currentAudioTime;
-      }
-    } else {
-      currentSilenceStreakMs += dtMs;
-      currentVocalStreakMs = 0;
-
-      if (isVocalActive && currentSilenceStreakMs >= 320) {
-        isVocalActive = false;
-        lastSilenceStartAudioTime = currentAudioTime;
-      }
-    }
+    const firedOnset = pendingPhraseOnset;
+    pendingPhraseOnset = false;
 
     return {
-      isSignalAvailable,
+      isSignalAvailable: isSignalAvailable && sileroReady,
       isVocalActive,
-      vocalScore: Math.round(smoothedVocalScore * 100) / 100,
+      vocalScore: Math.round(smoothedProb * 100) / 100,
       hasDetectedFirstVocal,
       firstVocalOnsetTime,
-      triggeredPhraseOnset,
+      triggeredPhraseOnset: firedOnset,
       lastPhraseOnsetAudioTime,
       silenceDurationSec: isVocalActive ? 0 : Math.max(0, currentSilenceStreakMs / 1000)
     };
@@ -329,9 +352,9 @@
 
   function getState(currentAudioTime = 0) {
     return {
-      isSignalAvailable,
+      isSignalAvailable: isSignalAvailable && sileroReady,
       isVocalActive,
-      vocalScore: Math.round(smoothedVocalScore * 100) / 100,
+      vocalScore: Math.round(smoothedProb * 100) / 100,
       hasDetectedFirstVocal,
       firstVocalOnsetTime,
       triggeredPhraseOnset: false,
@@ -342,12 +365,6 @@
   }
 
   function getDiagnostics(video) {
-    let maxBin = 0;
-    if (freqBuffer) {
-      for (let i = 0; i < freqBuffer.length; i++) {
-        if (freqBuffer[i] > maxBin) maxBin = freqBuffer[i];
-      }
-    }
     const streamTracks = attachedStream ? attachedStream.getAudioTracks().map(t => ({
       readyState: t.readyState,
       enabled: t.enabled,
@@ -355,17 +372,21 @@
     })) : [];
 
     return {
+      engine: 'silero-vad-v5-onnx',
+      sileroReady,
+      sileroLastError,
+      inferencesCount,
+      sileroProb,
+      sileroAvgProb,
+      smoothedProb: Math.round(smoothedProb * 1000) / 1000,
+      peakPcmAmplitude,
       audioCtxState: audioCtx ? audioCtx.state : 'none',
       sampleRate: audioCtx ? audioCtx.sampleRate : 0,
       hasMediaKeysDRM: Boolean(video && video.mediaKeys),
       videoSrc: video ? (video.currentSrc || video.src || '').slice(0, 48) : 'none',
       streamTracks,
-      isSignalAvailable,
-      nonZeroFramesCount,
-      maxFftBinValue: maxBin,
-      rollingNoiseFloor: Math.round(rollingNoiseFloor * 10) / 10,
-      rollingPeakVocal: Math.round(rollingPeakVocal * 10) / 10,
-      vocalScore: Math.round(smoothedVocalScore * 100) / 100,
+      isSignalAvailable: isSignalAvailable && sileroReady,
+      nonZeroBatchesCount,
       isVocalActive,
       hasDetectedFirstVocal,
       firstVocalOnsetTime
