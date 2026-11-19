@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "YTM Sync Lyrics",
+  "name": "__MSG_extName__",
   "version": "1.0.0",
-  "description": "Synced and beautifully styled glassmorphism lyrics for YouTube Music desktop and PWA.",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -41,9 +42,6 @@
   },
   "host_permissions": [
     "*://music.youtube.com/*",
-    "*://*.ggpht.com/*",
-    "*://*.googleusercontent.com/*",
-    "*://*.youtube.com/*",
     "https://lrclib.net/*",
     "https://huggingface.co/*",
     "https://*.hf.co/*"

@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "YTM Sync Lyrics – Letras YouTube Music",
+    "description": "Nombre de la extensión mostrado en el navegador y en la tienda."
+  },
+  "extDescription": {
+    "message": "Letras sincronizadas en tiempo real con auto-scroll para YouTube Music de escritorio y PWA, con alineación vocal por IA.",
+    "description": "Descripción corta mostrada en el navegador y en la tienda."
+  }
+}
