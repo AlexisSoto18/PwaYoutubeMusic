@@ -528,13 +528,39 @@
     }
 
     const dur = (durationSeconds && durationSeconds > 30) ? durationSeconds : 180;
-    const anchorCount = Object.keys(existingAnchors || {}).length;
-    const expectedLineByTime = Math.floor((windowStartTime / dur) * units.length);
-    const centerIdx = currentActiveIndex >= 0 ? currentActiveIndex : expectedLineByTime;
+    const anchorEntries = Object.entries(existingAnchors || {})
+      .map(([k, v]) => [Number(k), Number(v)])
+      .filter(([idx, t]) => Number.isInteger(idx) && !Number.isNaN(t))
+      .sort((a, b) => a[0] - b[0]);
 
-    // Search a monotonic window around the current/expected line to prevent jumping to repeated choruses
-    const searchStart = Math.max(0, centerIdx - (anchorCount > 0 ? 3 : 6));
-    const searchEnd = Math.min(units.length - 1, centerIdx + (anchorCount > 0 ? 12 : 18));
+    const expectedLineByTime = Math.floor((windowStartTime / dur) * units.length);
+
+    let searchStart;
+    let searchEnd;
+    let centerIdx;
+
+    if (anchorEntries.length > 0) {
+      // Find the latest anchor at or before windowStartTime to enforce physical singing speed
+      let prevAnchor = anchorEntries[anchorEntries.length - 1];
+      for (let k = anchorEntries.length - 1; k >= 0; k--) {
+        if (anchorEntries[k][1] <= windowStartTime + 1.0) {
+          prevAnchor = anchorEntries[k];
+          break;
+        }
+      }
+      const [lastIdx, lastTime] = prevAnchor;
+      const dt = Math.max(0.5, windowStartTime - lastTime);
+
+      // Physical singing speed bound: a singer cannot jump 14 lines in 2.8 seconds!
+      const maxPlausibleAdvance = Math.min(12, Math.max(3, Math.ceil(dt / 1.45)));
+      centerIdx = Math.min(units.length - 1, lastIdx + Math.max(1, Math.round(dt / 3.0)));
+      searchStart = Math.max(0, lastIdx);
+      searchEnd = Math.min(units.length - 1, lastIdx + maxPlausibleAdvance);
+    } else {
+      centerIdx = currentActiveIndex >= 0 ? currentActiveIndex : expectedLineByTime;
+      searchStart = Math.max(0, centerIdx - 4);
+      searchEnd = Math.min(units.length - 1, Math.min(centerIdx + 8, expectedLineByTime + 10));
+    }
 
     let bestLineIdx = -1;
     let bestScore = 0;
@@ -546,12 +572,15 @@
       // Skip very short ad-libs ("Uh", "Wuh") that cause false phonetic matches
       if (unit.text.length < 6) continue;
 
-      const distPenalty = Math.abs(i - centerIdx) * 0.012;
+      const lineDist = Math.abs(i - centerIdx);
+      const distPenalty = lineDist * 0.025;
+      // Require higher phonetic confidence for non-adjacent jumps
+      const minRequiredSim = lineDist <= 2 ? 0.46 : 0.56;
 
       for (const phrase of phrases) {
         const sim = phoneticSimilarity(unit.text, phrase.text);
         const score = sim - distPenalty;
-        if (sim >= 0.44 && score > bestScore) {
+        if (sim >= minRequiredSim && score > bestScore) {
           bestScore = score;
           bestSim = sim;
           bestLineIdx = i;
